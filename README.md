@@ -30,6 +30,9 @@ pip install -r requirements.txt
 
 # 运行第一个 Demo
 python demos/01_robot_arm_grasp.py
+
+# Unitree Demo 另外需要官方模型仓库（与本仓库放在同一父目录即可）
+git clone https://github.com/unitreerobotics/unitree_mujoco.git ../unitree_mujoco
 ```
 
 ## Demo 展示
@@ -90,7 +93,10 @@ python demos/03_deploy_model.py
 ```bash
 # 需要 conda 环境（含 MuJoCo + 宇树 SDK）
 conda activate unitree
-mjpython demos/04_g1_actions.py
+mjpython demos/04_g1_actions.py --unitree-mujoco-root ../unitree_mujoco
+
+# 不打开窗口，只验证模型路径和 29 个驱动器
+python demos/04_g1_actions.py --unitree-mujoco-root ../unitree_mujoco --validate-only
 ```
 
 > **为什么有些动作会摔倒？** 出拳和抬腿等剧烈动作用关键帧控制时容易失去平衡。这正是**强化学习的价值**——RL 能学到动态平衡策略，在做动作的同时实时调整全身关节补偿重心偏移。
@@ -104,6 +110,15 @@ mjpython demos/04_g1_actions.py
 </p>
 
 本项目集成了宇树官方 MuJoCo 仿真，支持 Go2 / G1 / H1 全系列。
+
+官方模型不复制进本仓库。脚本按以下优先级查找 `unitree_mujoco`：命令行
+`--unitree-mujoco-root`、环境变量 `UNITREE_MUJOCO_ROOT`、与本仓库同级的
+`unitree_mujoco/`。也可以用通用查看器加载任一支持型号：
+
+```bash
+python demos/05_unitree_viewer.py g1 --unitree-mujoco-root ../unitree_mujoco
+python demos/05_unitree_viewer.py go2 --unitree-mujoco-root ../unitree_mujoco --validate-only
+```
 
 | Go2 四足 | G1 人形 | H1 人形 |
 |:---:|:---:|:---:|
@@ -184,7 +199,10 @@ embodied-agent/
 │   ├── 02_rl_training.py           # 强化学习训练 (PyTorch)
 │   ├── 03_deploy_model.py          # 模型部署对比
 │   ├── 04_g1_actions.py            # 宇树 G1 动作演示 (MuJoCo)
+│   ├── 05_unitree_viewer.py        # 官方 Unitree 模型通用查看器
+│   ├── unitree_paths.py            # 外部 unitree_mujoco 路径解析
 │   └── rl_training.py              # 共享模块
+├── tests/                           # 无 GUI 路径解析单测
 ├── docs/
 │   ├── tech_stack.md               # 技术栈全景
 │   └── unitree_dev_guide.md        # 宇树开发指南

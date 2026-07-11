@@ -40,6 +40,16 @@ pip install mujoco pygame
 git clone https://github.com/unitreerobotics/unitree_rl_gym.git
 ```
 
+本仓库不复制官方模型。推荐把两个仓库放在同一父目录，或显式设置：
+
+```bash
+export UNITREE_MUJOCO_ROOT=/path/to/unitree_mujoco
+python demos/05_unitree_viewer.py g1 --validate-only
+mjpython demos/04_g1_actions.py
+```
+
+`--validate-only` 会加载 XML 并检查模型维度，但不会打开 GUI，适合安装后烟测。
+
 ## 可用机器人模型
 
 | 型号 | DOF | 驱动器数 | 仿真模型路径 |
