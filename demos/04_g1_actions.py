@@ -8,15 +8,15 @@
 
 用法:
     conda activate unitree
-    cd ~/projects/ios/unitree_mujoco
-    python demo_g1_actions.py
+    cd /path/to/embodied-agent
+    mjpython demos/04_g1_actions.py --unitree-mujoco-root ../unitree_mujoco
 """
 
-import mujoco
-import mujoco.viewer
+import argparse
 import numpy as np
 import time
-import os
+
+from unitree_paths import resolve_unitree_scene
 
 # ====================================================================
 # G1 关节索引映射（29个驱动器）
@@ -275,9 +275,35 @@ def taichi():
 # ====================================================================
 # 主程序
 # ====================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the Unitree G1 action sequence in MuJoCo")
+    parser.add_argument(
+        "--unitree-mujoco-root",
+        help="Path to an official unitree_mujoco checkout (or set UNITREE_MUJOCO_ROOT)",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Load and validate the G1 model without opening the viewer",
+    )
+    return parser.parse_args()
+
+
 def main():
-    scene = os.path.join(os.path.dirname(__file__), "unitree_robots/g1/scene.xml")
-    model = mujoco.MjModel.from_xml_path(scene)
+    args = parse_args()
+
+    import mujoco
+    import mujoco.viewer
+
+    scene = resolve_unitree_scene("g1", args.unitree_mujoco_root)
+    model = mujoco.MjModel.from_xml_path(str(scene))
+    if model.nu != NUM_ACTUATORS:
+        raise RuntimeError(f"Expected {NUM_ACTUATORS} G1 actuators, found {model.nu} in {scene}")
+
+    if args.validate_only:
+        print(f"G1 model valid: {scene} (nq={model.nq}, nu={model.nu}, njnt={model.njnt})")
+        return
+
     data = mujoco.MjData(model)
 
     # 初始化站立高度
