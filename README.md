@@ -50,9 +50,12 @@ git clone https://github.com/unitreerobotics/unitree_mujoco.git ../unitree_mujoc
 python demos/01_robot_arm_grasp.py
 ```
 
-### Demo 2: 强化学习训练
+### Demo 2: IK 引导的强化学习训练
 
-让**神经网络**通过试错学会控制机械臂。训练完输出 `trained_policy.pt` 模型文件。
+先用逆运动学（IK）生成示范，通过行为克隆和 DAgger 完成冷启动，再用
+TD3+BC 强化学习微调。IK 只在训练阶段担任老师，最终评估和部署仅使用 RL
+策略。训练完成后输出 `trained_policy.zip` 模型和
+`training_metrics.json` 指标。
 
 ```python
 obs = env.get_observation()          # 感知（13维向量）
@@ -62,6 +65,9 @@ env.step(action)                     # 执行（7个关节）
 
 ```bash
 python demos/02_rl_training.py
+
+# 快速验证完整流水线（不用于判断最终收敛）
+python demos/02_rl_training.py --quick
 ```
 
 ### Demo 3: 模型部署
@@ -196,12 +202,12 @@ ChannelFactory.Instance().Init(0, "eth0")    # 以太网
 embodied-agent/
 ├── demos/
 │   ├── 01_robot_arm_grasp.py       # 逆运动学抓取 (PyBullet)
-│   ├── 02_rl_training.py           # 强化学习训练 (PyTorch)
+│   ├── 02_rl_training.py           # IK 引导的 TD3+BC 训练入口
 │   ├── 03_deploy_model.py          # 模型部署对比
 │   ├── 04_g1_actions.py            # 宇树 G1 动作演示 (MuJoCo)
 │   ├── 05_unitree_viewer.py        # 官方 Unitree 模型通用查看器
 │   ├── unitree_paths.py            # 外部 unitree_mujoco 路径解析
-│   └── rl_training.py              # 共享模块
+│   └── rl_training.py              # Gymnasium 环境与训练流水线
 ├── tests/                           # 无 GUI 路径解析单测
 ├── docs/
 │   ├── tech_stack.md               # 技术栈全景

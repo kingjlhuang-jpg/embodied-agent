@@ -1,319 +1,826 @@
-"""
-示例2: 用强化学习训练一个AI控制机器人
-====================================
+"""IK-guided reinforcement learning for the Kuka reaching demos.
 
-这个程序展示了具身智能的核心训练流程：
-1. 创建一个仿真环境（机械臂 + 目标）
-2. AI（神经网络）通过反复试错学习控制策略
-3. 训练完成后保存模型权重文件
-4. 这个权重文件可以直接部署到真实机器人上运行
-
-整个训练过程不需要真实机器人——全部在你的电脑上完成。
+The training pipeline has three stages: behaviour cloning from an inverse-
+kinematics teacher, DAgger collection on policy-visited states, and TD3+BC
+fine-tuning. IK is used only during training; evaluation uses RL alone.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable
+
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import pybullet as p
 import pybullet_data
-import time
-from collections import deque
+import torch
+import torch.nn.functional as F
+from stable_baselines3 import TD3
+from stable_baselines3.common.noise import NormalActionNoise
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.utils import polyak_update
 
 
-# =============================================================
-# 第一部分：仿真环境（模拟真实世界）
-# =============================================================
-
-class RobotArmEnv:
-    """机械臂抓取环境
-
-    这就是一个"虚拟世界"：
-    - 有一个7关节机械臂
-    - 有一个随机放置的目标物体
-    - AI的任务是控制机械臂到达目标
-    - 到达目标获得奖励，远离则受到惩罚
-
-    这和 Gymnasium 的标准环境接口一致。
-    真实机器人也会包装成同样的接口。
-    """
-
-    def __init__(self, render=False):
-        # 选择是否显示3D窗口
-        if render:
-            self.client = p.connect(p.GUI)
-            p.resetDebugVisualizerCamera(1.5, 45, -30, [0.5, 0, 0.3])
-        else:
-            self.client = p.connect(p.DIRECT)  # 无头模式，训练时用这个（更快）
-
-        p.setGravity(0, 0, -9.81)
-        p.setTimeStep(1.0 / 240.0)
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-
-        self.robot_id = None
-        self.target_pos = None
-        self.step_count = 0
-        self.max_steps = 200
-
-        # 观测空间维度：7个关节角度 + 3个末端位置 + 3个目标位置 = 13
-        self.obs_dim = 13
-        # 动作空间维度：7个关节的角速度
-        self.action_dim = 7
-
-    def reset(self):
-        """重置环境——开始新的一轮尝试"""
-        p.resetSimulation()
-        p.setGravity(0, 0, -9.81)
-
-        # 加载地面和机械臂
-        p.loadURDF("plane.urdf")
-        self.robot_id = p.loadURDF(
-            "kuka_iiwa/model.urdf", [0, 0, 0], useFixedBase=True)
-
-        # 随机放置目标（每次位置不同，迫使AI学到泛化的策略）
-        self.target_pos = np.array([
-            0.4 + np.random.uniform(-0.15, 0.15),
-            np.random.uniform(-0.2, 0.2),
-            0.1 + np.random.uniform(0, 0.3)
-        ])
-
-        # 创建目标球体（绿色）
-        visual = p.createVisualShape(
-            p.GEOM_SPHERE, radius=0.03, rgbaColor=[0, 1, 0, 0.7])
-        p.createMultiBody(0, -1, visual, self.target_pos)
-
-        self.step_count = 0
-        return self._get_observation()
-
-    def step(self, action):
-        """执行一步动作
-
-        这是仿真环境的核心：
-        1. 接收AI输出的动作（关节角速度）
-        2. 在物理引擎中执行这个动作
-        3. 返回新的观测、奖励、是否结束
-
-        同样的接口，也可以接收真实机器人的传感器数据。
-        """
-        # 将AI的动作缩放到合理范围
-        action = np.clip(action, -1, 1) * 0.1
-
-        # 获取当前关节角度
-        joint_positions = []
-        for i in range(7):
-            state = p.getJointState(self.robot_id, i)
-            joint_positions.append(state[0])
-
-        # 设置新的关节目标 = 当前角度 + 动作增量
-        for i in range(7):
-            target = joint_positions[i] + action[i]
-            p.setJointMotorControl2(
-                self.robot_id, i, p.POSITION_CONTROL,
-                targetPosition=target, force=200)
-
-        # 物理引擎前进多步（模拟真实物理）
-        for _ in range(10):
-            p.stepSimulation()
-
-        self.step_count += 1
-
-        # 获取新状态
-        obs = self._get_observation()
-
-        # 计算奖励
-        ee_pos = self._get_ee_pos()
-        distance = np.linalg.norm(ee_pos - self.target_pos)
-
-        # 奖励设计：离目标越近奖励越高
-        reward = -distance  # 基础奖励：负的距离
-        if distance < 0.05:
-            reward += 10.0   # 到达目标：大奖励！
-        if distance < 0.02:
-            reward += 50.0   # 非常精确：超大奖励！
-
-        # 判断是否结束
-        done = (distance < 0.02) or (self.step_count >= self.max_steps)
-
-        return obs, reward, done, {"distance": distance}
-
-    def _get_observation(self):
-        """获取当前观测（AI的"眼睛看到的信息"）"""
-        joint_angles = []
-        for i in range(7):
-            state = p.getJointState(self.robot_id, i)
-            joint_angles.append(state[0])
-
-        ee_pos = self._get_ee_pos()
-
-        # 观测 = [7个关节角度, 末端xyz, 目标xyz]
-        obs = np.concatenate([joint_angles, ee_pos, self.target_pos])
-        return obs.astype(np.float32)
-
-    def _get_ee_pos(self):
-        """获取末端执行器位置"""
-        state = p.getLinkState(self.robot_id, 6)
-        return np.array(state[0])
-
-    def close(self):
-        p.disconnect()
+SUCCESS_DISTANCE = 0.02
+ACTION_SCALE = 0.1
+MODEL_PATH = Path("trained_policy.zip")
+BEST_MODEL_PATH = Path("best_policy.zip")
+METRICS_PATH = Path("training_metrics.json")
 
 
-# =============================================================
-# 第二部分：AI模型（神经网络）
-# =============================================================
+@dataclass(frozen=True)
+class TrainingConfig:
+    """Training sizes chosen for a fast local demonstration."""
 
-class PolicyNetwork(nn.Module):
-    """策略网络——AI的"大脑"
+    seed: int = 20260901
+    expert_steps: int = 20_000
+    bc_epochs: int = 20
+    dagger_iterations: int = 3
+    dagger_steps: int = 4_000
+    dagger_epochs: int = 6
+    critic_warmup_steps: int = 2_000
+    rl_phase_steps: tuple[int, ...] = (10_000, 15_000, 25_000)
+    curriculum: tuple[float, ...] = (1.00, 1.00, 1.00)
+    eval_episodes: int = 100
+    target_success_rate: float = 0.90
 
-    输入：当前观测（关节角度 + 末端位置 + 目标位置）
-    输出：每个关节应该怎么动（角速度）
+    @classmethod
+    def quick(cls, seed: int = 20260901) -> "TrainingConfig":
+        """Small configuration for smoke tests, not final convergence."""
 
-    就是一个普通的全连接神经网络。
-    训练完成后保存为 .pt 文件，可以部署到任何设备上。
-    """
-
-    def __init__(self, obs_dim=13, action_dim=7, hidden_dim=128):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()  # 输出范围 [-1, 1]
+        return cls(
+            seed=seed,
+            expert_steps=1_000,
+            bc_epochs=2,
+            dagger_iterations=1,
+            dagger_steps=500,
+            dagger_epochs=1,
+            critic_warmup_steps=50,
+            rl_phase_steps=(500,),
+            curriculum=(1.0,),
+            eval_episodes=10,
+            target_success_rate=1.0,
         )
 
-    def forward(self, obs):
-        return self.network(obs)
+
+@dataclass
+class Demonstrations:
+    """Expert labels plus real transitions for replay-buffer warm-up."""
+
+    observations: np.ndarray
+    teacher_actions: np.ndarray
+    executed_actions: np.ndarray
+    next_observations: np.ndarray
+    rewards: np.ndarray
+    dones: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.observations)
+
+    @classmethod
+    def concatenate(cls, datasets: Iterable["Demonstrations"]) -> "Demonstrations":
+        items = list(datasets)
+        return cls(*(
+            np.concatenate([getattr(item, field) for item in items], axis=0)
+            for field in cls.__dataclass_fields__
+        ))
 
 
-# =============================================================
-# 第三部分：训练（让AI通过试错学习）
-# =============================================================
+class RobotArmEnv(gym.Env):
+    """Gymnasium environment for Kuka end-effector reaching."""
 
-def train():
-    print("=" * 60)
-    print("  强化学习训练：教AI控制机械臂")
-    print("  (全部在仿真中完成，不需要真实机器人)")
-    print("=" * 60)
-    print()
+    metadata = {"render_modes": ["human"], "render_fps": 60}
 
-    # 创建仿真环境（无头模式，速度更快）
-    env = RobotArmEnv(render=False)
+    def __init__(
+        self,
+        render_mode: str | None = None,
+        *,
+        render: bool | None = None,
+        difficulty: float = 1.0,
+        max_steps: int = 200,
+    ):
+        super().__init__()
+        if render is not None:
+            render_mode = "human" if render else None
+        if render_mode not in (None, "human"):
+            raise ValueError(f"unsupported render_mode: {render_mode}")
 
-    # 创建AI模型
-    policy = PolicyNetwork()
-    optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+        self.render_mode = render_mode
+        self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        self.max_steps = max_steps
+        self.action_space = spaces.Box(-1.0, 1.0, shape=(7,), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            -2.0, 2.0, shape=(13,), dtype=np.float32)
 
-    # 简单的进化策略（ES）训练
-    # 这比标准RL更简单，适合演示
-    best_reward = -float('inf')
-    reward_history = deque(maxlen=50)
+        mode = p.GUI if render_mode == "human" else p.DIRECT
+        self.client = p.connect(mode)
+        if self.client < 0:
+            raise RuntimeError("failed to connect to PyBullet")
+        p.setAdditionalSearchPath(
+            pybullet_data.getDataPath(), physicsClientId=self.client)
+        if render_mode == "human":
+            p.resetDebugVisualizerCamera(
+                1.5, 45, -30, [0.5, 0, 0.3], physicsClientId=self.client)
 
-    num_episodes = 200
-    print(f"开始训练 {num_episodes} 轮...\n")
+        self.robot_id = -1
+        self.target_pos = np.zeros(3, dtype=np.float64)
+        self.step_count = 0
+        self.previous_distance = 0.0
+        self.previous_action = np.zeros(7, dtype=np.float32)
+        self.joint_lower = np.full(7, -np.pi, dtype=np.float64)
+        self.joint_upper = np.full(7, np.pi, dtype=np.float64)
 
-    for episode in range(num_episodes):
-        # 重置环境（目标位置随机变化）
-        obs = env.reset()
-        total_reward = 0
-        episode_distances = []
+    def set_difficulty(self, difficulty: float) -> None:
+        """Set curriculum difficulty for targets generated on future resets."""
 
-        # 一轮尝试
-        for step in range(200):
-            # AI根据观测决定动作
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+        self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        super().reset(seed=seed)
+        del options
+
+        p.resetSimulation(physicsClientId=self.client)
+        p.setGravity(0, 0, -9.81, physicsClientId=self.client)
+        p.setTimeStep(1.0 / 240.0, physicsClientId=self.client)
+        p.loadURDF("plane.urdf", physicsClientId=self.client)
+        self.robot_id = p.loadURDF(
+            "kuka_iiwa/model.urdf",
+            [0, 0, 0],
+            useFixedBase=True,
+            physicsClientId=self.client,
+        )
+
+        for joint in range(7):
+            info = p.getJointInfo(
+                self.robot_id, joint, physicsClientId=self.client)
+            self.joint_lower[joint] = info[8]
+            self.joint_upper[joint] = info[9]
+
+        full_target = np.array([
+            0.4 + self.np_random.uniform(-0.15, 0.15),
+            self.np_random.uniform(-0.2, 0.2),
+            0.1 + self.np_random.uniform(0, 0.3),
+        ])
+        initial_ee = self._get_ee_pos()
+        self.target_pos = (
+            initial_ee + self.difficulty * (full_target - initial_ee))
+
+        visual = p.createVisualShape(
+            p.GEOM_SPHERE,
+            radius=0.03,
+            rgbaColor=[0, 1, 0, 0.7],
+            physicsClientId=self.client,
+        )
+        p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=visual,
+            basePosition=self.target_pos,
+            physicsClientId=self.client,
+        )
+
+        self.step_count = 0
+        self.previous_action.fill(0.0)
+        self.previous_distance = self._distance_to_target()
+        return self._get_observation(), self._info(self.previous_distance)
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float32)
+        if action.shape != self.action_space.shape:
+            raise ValueError(f"expected action shape (7,), got {action.shape}")
+        action = np.clip(action, -1.0, 1.0)
+
+        joint_positions = self._get_joint_positions()
+        joint_targets = joint_positions + action * ACTION_SCALE
+        joint_targets = np.clip(joint_targets, self.joint_lower, self.joint_upper)
+        for joint, target in enumerate(joint_targets):
+            p.setJointMotorControl2(
+                self.robot_id,
+                joint,
+                p.POSITION_CONTROL,
+                targetPosition=float(target),
+                force=200,
+                physicsClientId=self.client,
+            )
+
+        for _ in range(10):
+            p.stepSimulation(physicsClientId=self.client)
+
+        self.step_count += 1
+        distance = self._distance_to_target()
+        progress = self.previous_distance - distance
+        smoothness_cost = np.square(action - self.previous_action).sum()
+        reward = (
+            20.0 * progress
+            - 0.1 * distance
+            - 0.002 * np.square(action).sum()
+            - 0.001 * smoothness_cost
+        )
+        terminated = distance < SUCCESS_DISTANCE
+        if terminated:
+            reward += 10.0
+        truncated = self.step_count >= self.max_steps
+
+        self.previous_distance = distance
+        self.previous_action = action.copy()
+        return (
+            self._get_observation(),
+            float(reward),
+            bool(terminated),
+            bool(truncated),
+            self._info(distance),
+        )
+
+    def get_ik_action(self) -> np.ndarray:
+        """Return the normalized one-step action chosen by the IK teacher."""
+
+        current = self._get_joint_positions()
+        ranges = np.maximum(self.joint_upper - self.joint_lower, 1e-3)
+        solution = p.calculateInverseKinematics(
+            self.robot_id,
+            6,
+            self.target_pos,
+            lowerLimits=self.joint_lower.tolist(),
+            upperLimits=self.joint_upper.tolist(),
+            jointRanges=ranges.tolist(),
+            restPoses=current.tolist(),
+            maxNumIterations=100,
+            residualThreshold=1e-5,
+            physicsClientId=self.client,
+        )
+        delta = np.asarray(solution[:7]) - current
+        return np.clip(delta / ACTION_SCALE, -1.0, 1.0).astype(np.float32)
+
+    def _get_joint_positions(self) -> np.ndarray:
+        return np.array([
+            p.getJointState(
+                self.robot_id, joint, physicsClientId=self.client)[0]
+            for joint in range(7)
+        ])
+
+    def _get_ee_pos(self) -> np.ndarray:
+        state = p.getLinkState(
+            self.robot_id, 6, physicsClientId=self.client)
+        return np.asarray(state[0])
+
+    def _distance_to_target(self) -> float:
+        return float(np.linalg.norm(self._get_ee_pos() - self.target_pos))
+
+    def _get_observation(self) -> np.ndarray:
+        joints = self._get_joint_positions() / np.pi
+        ee_pos = self._get_ee_pos() / 1.5
+        target_error = (self.target_pos - self._get_ee_pos()) / 1.5
+        observation = np.concatenate([joints, ee_pos, target_error])
+        return np.clip(observation, -2.0, 2.0).astype(np.float32)
+
+    def _info(self, distance: float) -> dict[str, float | bool]:
+        return {
+            "distance": float(distance),
+            "is_success": bool(distance < SUCCESS_DISTANCE),
+            "difficulty": self.difficulty,
+        }
+
+    def close(self):
+        if getattr(self, "client", -1) >= 0 and p.isConnected(self.client):
+            p.disconnect(self.client)
+            self.client = -1
+
+
+class GuidedTD3(TD3):
+    """TD3+BC-style updates that keep the actor near its IK teacher."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._expert_observations: torch.Tensor | None = None
+        self._expert_actions: torch.Tensor | None = None
+        self._bc_start = 1.0
+        self._bc_end = 0.25
+        self._bc_decay_updates = 50_000
+        self.rl_weight = 0.01
+
+    def set_expert_data(
+        self,
+        demonstrations: Demonstrations,
+        *,
+        start: float = 1.0,
+        end: float = 0.25,
+        decay_updates: int = 50_000,
+    ) -> None:
+        self._expert_observations = torch.as_tensor(
+            demonstrations.observations, device=self.device)
+        self._expert_actions = torch.as_tensor(
+            demonstrations.teacher_actions, device=self.device)
+        self._bc_start = start
+        self._bc_end = end
+        self._bc_decay_updates = max(decay_updates, 1)
+
+    def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+        if self._expert_observations is None or self._expert_actions is None:
+            raise RuntimeError("expert data must be attached before TD3+BC training")
+
+        self.policy.set_training_mode(True)
+        self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
+        actor_losses = []
+        critic_losses = []
+        bc_losses = []
+
+        for _ in range(gradient_steps):
+            self._n_updates += 1
+            replay_data = self.replay_buffer.sample(
+                batch_size, env=self._vec_normalize_env)
+            discounts = (
+                replay_data.discounts
+                if replay_data.discounts is not None
+                else self.gamma
+            )
             with torch.no_grad():
-                action = policy(obs_tensor).squeeze(0).numpy()
+                noise = replay_data.actions.clone().normal_(
+                    0, self.target_policy_noise)
+                noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
+                next_actions = (
+                    self.actor_target(replay_data.next_observations) + noise
+                ).clamp(-1, 1)
+                next_q_values = torch.cat(
+                    self.critic_target(
+                        replay_data.next_observations, next_actions),
+                    dim=1,
+                ).min(dim=1, keepdim=True).values
+                target_q_values = (
+                    replay_data.rewards
+                    + (1 - replay_data.dones) * discounts * next_q_values
+                )
 
-            # 训练时添加探索噪声（鼓励AI尝试新动作）
-            noise_scale = max(0.3 * (1 - episode / num_episodes), 0.05)
-            action = action + np.random.normal(0, noise_scale, size=action.shape)
+            current_q_values = self.critic(
+                replay_data.observations, replay_data.actions)
+            critic_loss = sum(
+                F.mse_loss(current_q, target_q_values)
+                for current_q in current_q_values
+            )
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic.optimizer.step()
+            critic_losses.append(critic_loss.item())
 
-            # 执行动作，获取反馈
-            obs, reward, done, info = env.step(action)
-            total_reward += reward
-            episode_distances.append(info["distance"])
+            if self._n_updates % self.policy_delay == 0:
+                policy_actions = self.actor(replay_data.observations)
+                q_values = self.critic.q1_forward(
+                    replay_data.observations, policy_actions)
+                q_scale = q_values.abs().mean().detach().clamp_min(1e-3)
+                rl_loss = -self.rl_weight * q_values.mean() / q_scale
 
-            if done:
-                break
+                expert_indices = torch.randint(
+                    len(self._expert_observations),
+                    (batch_size,),
+                    device=self.device,
+                )
+                expert_predictions = self.actor(
+                    self._expert_observations[expert_indices])
+                bc_loss = F.mse_loss(
+                    expert_predictions, self._expert_actions[expert_indices])
+                progress = min(self._n_updates / self._bc_decay_updates, 1.0)
+                bc_coefficient = (
+                    self._bc_start
+                    + progress * (self._bc_end - self._bc_start)
+                )
+                actor_loss = rl_loss + bc_coefficient * bc_loss
 
-        reward_history.append(total_reward)
-        avg_reward = np.mean(reward_history)
-        min_dist = min(episode_distances)
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                self.actor.optimizer.step()
+                actor_losses.append(actor_loss.item())
+                bc_losses.append(bc_loss.item())
 
-        # 如果这轮表现更好，用这轮的经验更新模型
-        if total_reward > best_reward:
-            best_reward = total_reward
-            # 保存最佳模型
-            torch.save(policy.state_dict(), "best_policy.pt")
+                polyak_update(
+                    self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                polyak_update(
+                    self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                polyak_update(
+                    self.critic_batch_norm_stats,
+                    self.critic_batch_norm_stats_target,
+                    1.0,
+                )
+                polyak_update(
+                    self.actor_batch_norm_stats,
+                    self.actor_batch_norm_stats_target,
+                    1.0,
+                )
 
-        # 简单的策略梯度更新
-        obs = env.reset()
-        log_probs = []
-        rewards = []
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/critic_loss", float(np.mean(critic_losses)))
+        if actor_losses:
+            self.logger.record("train/actor_loss", float(np.mean(actor_losses)))
+            self.logger.record("train/ik_bc_loss", float(np.mean(bc_losses)))
+            self.logger.record("train/rl_weight", self.rl_weight)
 
-        for step in range(200):
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-            action = policy(obs_tensor).squeeze(0)
+    def _excluded_save_params(self) -> list[str]:
+        return super()._excluded_save_params() + [
+            "_expert_observations", "_expert_actions"]
 
-            # 添加噪声并记录概率
-            noise = torch.randn_like(action) * noise_scale
-            noisy_action = action + noise
-            log_prob = -0.5 * (noise ** 2).sum()
-            log_probs.append(log_prob)
 
-            obs, reward, done, info = env.step(noisy_action.detach().numpy())
-            rewards.append(reward)
+def collect_demonstrations(
+    env: RobotArmEnv,
+    steps: int,
+    *,
+    seed: int,
+    model: TD3 | None = None,
+    teacher_mix: float = 1.0,
+    noise_scale: float = 0.03,
+) -> Demonstrations:
+    """Collect IK labels, optionally on states visited by a learned policy."""
 
-            if done:
-                break
+    rng = np.random.default_rng(seed)
+    observations: list[np.ndarray] = []
+    teacher_actions: list[np.ndarray] = []
+    executed_actions: list[np.ndarray] = []
+    next_observations: list[np.ndarray] = []
+    rewards: list[float] = []
+    dones: list[bool] = []
 
-        # 策略梯度更新
-        returns = []
-        R = 0
-        for r in reversed(rewards):
-            R = r + 0.99 * R
-            returns.insert(0, R)
-        returns = torch.FloatTensor(returns)
-        if len(returns) > 1:
-            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+    episode = 0
+    observation, _ = env.reset(seed=seed)
+    while len(observations) < steps:
+        teacher_action = env.get_ik_action()
+        if model is None:
+            policy_action = teacher_action
+        else:
+            policy_action, _ = model.predict(observation, deterministic=True)
+        action = (
+            teacher_mix * teacher_action
+            + (1.0 - teacher_mix) * np.asarray(policy_action)
+        )
+        action = np.clip(
+            action + rng.normal(0.0, noise_scale, size=7), -1.0, 1.0)
+        next_observation, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
 
-        loss = 0
-        for log_prob, R in zip(log_probs, returns):
-            loss -= log_prob * R
+        observations.append(observation)
+        teacher_actions.append(teacher_action)
+        executed_actions.append(action.astype(np.float32))
+        next_observations.append(next_observation)
+        rewards.append(reward)
+        dones.append(done)
 
-        optimizer.zero_grad()
+        observation = next_observation
+        if done:
+            episode += 1
+            observation, _ = env.reset(seed=seed + episode)
+
+    return Demonstrations(
+        observations=np.asarray(observations, dtype=np.float32),
+        teacher_actions=np.asarray(teacher_actions, dtype=np.float32),
+        executed_actions=np.asarray(executed_actions, dtype=np.float32),
+        next_observations=np.asarray(next_observations, dtype=np.float32),
+        rewards=np.asarray(rewards, dtype=np.float32),
+        dones=np.asarray(dones, dtype=np.float32),
+    )
+
+
+def pretrain_actor(
+    model: TD3,
+    demonstrations: Demonstrations,
+    *,
+    epochs: int,
+    batch_size: int = 256,
+    seed: int,
+) -> float:
+    """Behaviour-clone the deterministic TD3 actor from IK labels."""
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    observations = torch.as_tensor(
+        demonstrations.observations, device=model.device)
+    teacher_actions = torch.as_tensor(
+        demonstrations.teacher_actions, device=model.device)
+    final_loss = 0.0
+
+    model.actor.train(True)
+    for _ in range(epochs):
+        permutation = torch.randperm(
+            len(demonstrations), generator=generator)
+        total_loss = 0.0
+        batches = 0
+        for start in range(0, len(demonstrations), batch_size):
+            indices = permutation[start:start + batch_size].to(model.device)
+            predicted = model.actor(observations[indices])
+            loss = F.smooth_l1_loss(predicted, teacher_actions[indices])
+            model.actor.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 1.0)
+            model.actor.optimizer.step()
+            total_loss += loss.item()
+            batches += 1
+        final_loss = total_loss / max(batches, 1)
+    if hasattr(model, "actor_target"):
+        model.actor_target.load_state_dict(model.actor.state_dict())
+    return final_loss
+
+
+def add_to_replay_buffer(model: TD3, demonstrations: Demonstrations) -> None:
+    """Warm TD3's replay buffer with transitions seen during imitation."""
+
+    for index in range(len(demonstrations)):
+        done = bool(demonstrations.dones[index])
+        model.replay_buffer.add(
+            demonstrations.observations[index][None, :],
+            demonstrations.next_observations[index][None, :],
+            demonstrations.executed_actions[index][None, :],
+            np.array([demonstrations.rewards[index]], dtype=np.float32),
+            np.array([done], dtype=np.float32),
+            [{"TimeLimit.truncated": False}],
+        )
+
+
+def warmup_critic(model: GuidedTD3, gradient_steps: int, batch_size: int = 256) -> None:
+    """Fit TD3 critics on demonstrations before allowing actor updates."""
+
+    model.policy.set_training_mode(True)
+    for gradient_step in range(gradient_steps):
+        replay_data = model.replay_buffer.sample(batch_size)
+        with torch.no_grad():
+            next_actions = model.actor_target(replay_data.next_observations)
+            next_q_values = torch.cat(
+                model.critic_target(replay_data.next_observations, next_actions),
+                dim=1,
+            ).min(dim=1, keepdim=True).values
+            targets = (
+                replay_data.rewards
+                + (1.0 - replay_data.dones) * model.gamma * next_q_values
+            )
+
+        current_q_values = model.critic(
+            replay_data.observations, replay_data.actions)
+        loss = 0.5 * sum(
+            F.mse_loss(current_q, targets) for current_q in current_q_values)
+        model.critic.optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        model.critic.optimizer.step()
+        polyak_update(
+            model.critic.parameters(), model.critic_target.parameters(), model.tau)
 
-        # 打印训练进度
-        if (episode + 1) % 10 == 0:
-            print(f"  轮次 {episode + 1:3d}/{num_episodes} | "
-                  f"奖励: {total_reward:8.1f} | "
-                  f"平均: {avg_reward:8.1f} | "
-                  f"最近距离: {min_dist:.4f}m | "
-                  f"最佳: {best_reward:8.1f}")
 
-    env.close()
+def evaluate(
+    model: TD3,
+    *,
+    episodes: int,
+    seed: int,
+    difficulty: float = 1.0,
+) -> dict[str, float | int]:
+    """Evaluate RL alone on a deterministic set of random targets."""
 
-    # 保存最终模型
-    model_path = "trained_policy.pt"
-    torch.save(policy.state_dict(), model_path)
+    env = RobotArmEnv(difficulty=difficulty)
+    distances: list[float] = []
+    steps: list[int] = []
+    try:
+        for episode in range(episodes):
+            observation, _ = env.reset(seed=seed + episode)
+            info: dict[str, float | bool] = {}
+            for step in range(env.max_steps):
+                action, _ = model.predict(observation, deterministic=True)
+                observation, _, terminated, truncated, info = env.step(action)
+                if terminated or truncated:
+                    break
+            distances.append(float(info["distance"]))
+            steps.append(step + 1)
+    finally:
+        env.close()
 
-    print()
-    print("=" * 60)
-    print(f"  训练完成！模型已保存到: {model_path}")
-    print()
-    print("  这个 .pt 文件就是AI学到的'技能'。")
-    print("  它可以被加载到：")
-    print("    - 另一个仿真环境中运行")
-    print("    - 真实机器人的 Jetson 电脑上运行")
-    print("    - 任何有 PyTorch 的设备上运行")
-    print()
-    print("  运行 demo_deploy_model.py 来看训练效果")
-    print("=" * 60)
+    distance_array = np.asarray(distances)
+    step_array = np.asarray(steps)
+    successes = int(np.sum(distance_array < SUCCESS_DISTANCE))
+    return {
+        "episodes": episodes,
+        "successes": successes,
+        "success_rate": successes / episodes,
+        "mean_distance_m": float(distance_array.mean()),
+        "p95_distance_m": float(np.percentile(distance_array, 95)),
+        "mean_steps": float(step_array.mean()),
+    }
+
+
+def print_evaluation(label: str, metrics: dict[str, float | int]) -> None:
+    print(
+        f"[{label}] 2cm成功率={metrics['success_rate']:.1%} "
+        f"({metrics['successes']}/{metrics['episodes']}) | "
+        f"平均误差={metrics['mean_distance_m'] * 100:.2f}cm | "
+        f"P95={metrics['p95_distance_m'] * 100:.2f}cm | "
+        f"平均步数={metrics['mean_steps']:.1f}",
+        flush=True,
+    )
+
+
+def build_td3(env: RobotArmEnv, seed: int) -> GuidedTD3:
+    return GuidedTD3(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        buffer_size=200_000,
+        learning_starts=0,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        train_freq=1,
+        gradient_steps=1,
+        action_noise=NormalActionNoise(
+            mean=np.zeros(7), sigma=np.full(7, 0.05)),
+        policy_delay=2,
+        target_policy_noise=0.1,
+        target_noise_clip=0.2,
+        policy_kwargs={"net_arch": [128, 128]},
+        seed=seed,
+        verbose=0,
+        device="auto",
+    )
+
+
+def train(config: TrainingConfig) -> dict:
+    print("=" * 72)
+    print("  Demo 2: IK示范 + DAgger + TD3+BC 快速收敛训练")
+    print("  最终评估只使用RL策略，不调用IK")
+    print("=" * 72, flush=True)
+
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    train_env = RobotArmEnv(difficulty=config.curriculum[0])
+    data_env = RobotArmEnv(difficulty=1.0)
+    model = build_td3(train_env, config.seed)
+    history: list[dict] = []
+    best_success_rate = -1.0
+
+    try:
+        print(f"\n[1/3] 收集 {config.expert_steps} 条IK示范...", flush=True)
+        expert_data = collect_demonstrations(
+            data_env,
+            config.expert_steps,
+            seed=config.seed,
+            noise_scale=0.03,
+        )
+        bc_loss = pretrain_actor(
+            model,
+            expert_data,
+            epochs=config.bc_epochs,
+            seed=config.seed,
+        )
+        add_to_replay_buffer(model, expert_data)
+        print(f"      行为克隆完成，loss={bc_loss:.6f}", flush=True)
+        metrics = evaluate(
+            model, episodes=config.eval_episodes, seed=config.seed + 100_000)
+        print_evaluation("行为克隆", metrics)
+        history.append({"stage": "behavior_cloning", **metrics})
+        best_success_rate = float(metrics["success_rate"])
+        model.save(BEST_MODEL_PATH)
+
+        datasets = [expert_data]
+        combined = expert_data
+        print(f"\n[2/3] DAgger {config.dagger_iterations} 轮...", flush=True)
+        for iteration in range(config.dagger_iterations):
+            teacher_mix = max(0.5 - 0.25 * iteration, 0.0)
+            dagger_data = collect_demonstrations(
+                data_env,
+                config.dagger_steps,
+                seed=config.seed + 10_000 * (iteration + 1),
+                model=model,
+                teacher_mix=teacher_mix,
+                noise_scale=0.02,
+            )
+            datasets.append(dagger_data)
+            combined = Demonstrations.concatenate(datasets)
+            bc_loss = pretrain_actor(
+                model,
+                combined,
+                epochs=config.dagger_epochs,
+                seed=config.seed + iteration + 1,
+            )
+            add_to_replay_buffer(model, dagger_data)
+            metrics = evaluate(
+                model,
+                episodes=config.eval_episodes,
+                seed=config.seed + 100_000,
+            )
+            print_evaluation(f"DAgger {iteration + 1}", metrics)
+            print(
+                f"      数据量={len(combined)}，teacher_mix={teacher_mix:.2f}，"
+                f"loss={bc_loss:.6f}",
+                flush=True,
+            )
+            history.append({"stage": f"dagger_{iteration + 1}", **metrics})
+            if metrics["success_rate"] > best_success_rate:
+                best_success_rate = float(metrics["success_rate"])
+                model.save(BEST_MODEL_PATH)
+
+        # Behaviour cloning changes the actor after TD3 creates its target copy.
+        # Synchronize them before critic warm-up and online RL.
+        model.actor_target.load_state_dict(model.actor.state_dict())
+        print("\n[3/3] TD3+BC在线强化学习微调...", flush=True)
+        model.set_expert_data(
+            combined,
+            start=1.0,
+            end=0.25,
+            decay_updates=sum(config.rl_phase_steps),
+        )
+        print(
+            f"      先用 {config.critic_warmup_steps} 次专家回放预热critic...",
+            flush=True,
+        )
+        warmup_critic(model, config.critic_warmup_steps)
+        total_rl_steps = 0
+        for phase, (difficulty, phase_steps) in enumerate(
+            zip(config.curriculum, config.rl_phase_steps), start=1
+        ):
+            train_env.set_difficulty(difficulty)
+            model.learn(
+                total_timesteps=phase_steps,
+                reset_num_timesteps=False,
+                progress_bar=False,
+            )
+            total_rl_steps += phase_steps
+            metrics = evaluate(
+                model,
+                episodes=config.eval_episodes,
+                seed=config.seed + 100_000,
+            )
+            label = f"TD3+BC阶段{phase} difficulty={difficulty:.2f}"
+            print_evaluation(label, metrics)
+            history.append({
+                "stage": f"td3_bc_{phase}",
+                "difficulty": difficulty,
+                "rl_steps": total_rl_steps,
+                **metrics,
+            })
+            if metrics["success_rate"] > best_success_rate:
+                best_success_rate = float(metrics["success_rate"])
+                model.save(BEST_MODEL_PATH)
+            elif metrics["success_rate"] + 0.05 < best_success_rate:
+                model.set_parameters(
+                    BEST_MODEL_PATH, exact_match=True, device=model.device)
+                model.rl_weight *= 0.25
+                print(
+                    "      RL策略出现明显退化，已恢复最佳权重并降低RL更新权重。",
+                    flush=True,
+                )
+            if (
+                total_rl_steps >= 5_000
+                and metrics["success_rate"] >= config.target_success_rate
+            ):
+                print("      已达到目标成功率，提前停止课程训练。", flush=True)
+                break
+
+        # Always deploy the best fixed-evaluation checkpoint, never a regressed
+        # final online-RL update.
+        model.set_parameters(BEST_MODEL_PATH, exact_match=True, device=model.device)
+        model.save(MODEL_PATH)
+        final_metrics = evaluate(
+            model, episodes=config.eval_episodes, seed=config.seed + 200_000)
+        print_evaluation("最终独立测试集", final_metrics)
+        result = {
+            "config": asdict(config),
+            "history": history,
+            "final": final_metrics,
+            "model_path": str(MODEL_PATH),
+            "best_model_path": str(BEST_MODEL_PATH),
+        }
+        METRICS_PATH.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n模型已保存到 {MODEL_PATH}")
+        print(f"训练指标已保存到 {METRICS_PATH}")
+        return result
+    finally:
+        data_env.close()
+        train_env.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train the Kuka reaching policy with IK-guided TD3+BC.")
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="run a small smoke test instead of convergence training")
+    parser.add_argument("--seed", type=int, default=20260901)
+    parser.add_argument(
+        "--check-env", action="store_true",
+        help="validate the Gymnasium environment and exit")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.check_env:
+        env = RobotArmEnv()
+        try:
+            check_env(env, warn=True)
+            print("Gymnasium environment check passed.")
+        finally:
+            env.close()
+        return
+    config = TrainingConfig.quick(args.seed) if args.quick else TrainingConfig(
+        seed=args.seed)
+    train(config)
 
 
 if __name__ == "__main__":
-    train()
+    main()

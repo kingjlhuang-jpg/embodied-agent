@@ -3,9 +3,9 @@
 ## 本项目技术栈
 
 ```
-Python 3.9+ ─── PyBullet (物理仿真) ─── PyTorch (AI) ─── Gymnasium (RL接口)
+Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── Gymnasium (RL接口)
                     │                        │
-                    │                        └── trained_policy.pt (可部署模型)
+                    │                        └── trained_policy.zip (可部署模型)
                     │
                     ├── Bullet 物理引擎 (碰撞/重力/摩擦/力矩)
                     ├── URDF 机器人模型 (Kuka iiwa 7-DOF)
@@ -61,7 +61,7 @@ Python 3.9+ ─── PyBullet (物理仿真) ─── PyTorch (AI) ─── G
 | `p.setJointMotorControl2()` | 发布 `/arm/commands` | 指令目标：仿真器 → CAN总线 |
 | `p.stepSimulation()` | 删除 | 真实世界自动运行 |
 | `env.reset()` | 人工复位 | 真实世界没有重置按钮 |
-| `trained_policy.pt` | **直接复用** | AI 模型完全不变 |
+| `trained_policy.zip` | **直接复用** | AI 模型完全不变 |
 
 ## 关键概念索引
 
@@ -73,6 +73,7 @@ Python 3.9+ ─── PyBullet (物理仿真) ─── PyTorch (AI) ─── G
 | **Gymnasium 环境** | Demo 2 | 标准的 obs/action/reward/done 接口 |
 | **策略网络** | Demo 2 | 神经网络：观测 → 动作 |
 | **奖励设计** | Demo 2 | 距离越近奖励越高，到达给额外奖励 |
-| **策略梯度** | Demo 2 | 用回报加权更新网络参数 |
-| **模型部署** | Demo 3 | 加载 .pt 文件，推理模式运行 |
+| **IK 引导训练** | Demo 2 | 行为克隆 + DAgger 加速冷启动 |
+| **TD3+BC** | Demo 2 | 经验回放 + IK 行为约束的连续动作强化学习 |
+| **模型部署** | Demo 3 | 加载 Stable-Baselines3 模型运行 |
 | **Sim-to-Real** | Demo 3 | 仿真训练 → 真机运行，模型不变 |

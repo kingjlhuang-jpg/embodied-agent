@@ -3,7 +3,7 @@
 =================================================
 
 这个程序演示"部署"阶段：
-1. 加载训练好的 .pt 模型文件
+1. 加载训练好的 Stable-Baselines3 .zip 模型文件
 2. 在仿真环境中运行（带3D可视化）
 3. 观察AI控制机械臂的效果
 
@@ -11,18 +11,17 @@
 只是把 RobotArmEnv 替换为真实硬件的 ROS 2 接口。
 """
 
-import numpy as np
-import torch
-import pybullet as p
-import time
 import os
-
 import sys
-import os
+import time
+from pathlib import Path
+
+from stable_baselines3 import TD3
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 复用训练时的环境和模型定义
-from rl_training import RobotArmEnv, PolicyNetwork
+# 复用训练时的环境定义
+from rl_training import RobotArmEnv
 
 
 def deploy_in_simulation():
@@ -32,21 +31,15 @@ def deploy_in_simulation():
     print("=" * 60)
     print()
 
-    # 1. 加载训练好的AI模型
-    policy = PolicyNetwork()
-
-    model_path = "trained_policy.pt"
+    # 1. 加载训练好的 TD3+BC 模型
+    model_path = Path("trained_policy.zip")
     try:
-        policy.load_state_dict(torch.load(model_path, weights_only=True))
+        policy = TD3.load(model_path, device="auto")
         print(f"[OK] 已加载模型: {model_path}")
     except FileNotFoundError:
         print(f"[!] 未找到 {model_path}")
         print("    请先运行 demos/02_rl_training.py 训练模型")
-        print("    或者我将使用随机初始化的模型进行演示")
-        print()
-
-    # 切换到推理模式（关闭dropout等）
-    policy.train(False)
+        return
 
     # 2. 创建仿真环境（带3D可视化）
     print("[OK] 创建仿真环境（带可视化窗口）...")
@@ -62,7 +55,7 @@ def deploy_in_simulation():
         episode = 0
         while True:
             episode += 1
-            obs = env.reset()
+            obs, _ = env.reset()
             total_reward = 0
 
             print(f"--- 第 {episode} 轮 (目标位置: "
@@ -70,18 +63,16 @@ def deploy_in_simulation():
 
             for step in range(200):
                 # AI推理：观测 → 动作
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-                with torch.no_grad():
-                    action = policy(obs_tensor).squeeze(0).numpy()
+                action, _ = policy.predict(obs, deterministic=True)
 
                 # 执行动作
-                obs, reward, done, info = env.step(action)
+                obs, reward, terminated, truncated, info = env.step(action)
                 total_reward += reward
 
                 # 慢放，方便观察
                 time.sleep(1.0 / 60.0)
 
-                if done:
+                if terminated or truncated:
                     break
 
             distance = info["distance"]
@@ -107,9 +98,9 @@ def show_deployment_comparison():
     print()
     print("  [仿真环境中运行（你现在做的）]")
     print("  +-----------------------------------------+")
-    print("  | obs = env.reset()       # 仿真器API     |")
-    print("  | action = policy(obs)    # AI推理         |")
-    print("  | obs, r, done, _ = env.step(action)      |")
+    print("  | obs, _ = env.reset()       # 仿真器API  |")
+    print("  | action, _ = policy.predict(obs) # 推理  |")
+    print("  | obs, r, term, trunc, _ = env.step(a)   |")
     print("  +-----------------------------------------+")
     print()
     print("  [真实机器人上运行（买了机器人后）]")

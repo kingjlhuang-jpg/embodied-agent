@@ -501,7 +501,7 @@ class PolicyNetwork(nn.Module):
 ──────────                     ──────
 obs[0:7]   = 关节角度           机器人当前姿态
 obs[7:10]  = 末端 xyz           手在哪里
-obs[10:13] = 目标 xyz           目标在哪里
+obs[10:13] = 目标误差 xyz       目标相对末端在哪里
 
    ↓ nn.Linear(13, 128)        全连接: 每个输入和128个神经元相连
    ↓ ReLU()                    激活: max(0, x)，引入非线性
@@ -524,16 +524,16 @@ action[0:7] = 关节角速度增量     每个关节转快/转慢多少
 Demo 2 的奖励设计：
 
 ```python
-# 基础奖励: 负的距离（离目标越近奖励越高）
-reward = -distance
+# 每靠近一步都获得反馈，同时惩罚大动作和动作突变
+reward = (
+    20.0 * (previous_distance - distance)
+    - 0.1 * distance
+    - 0.002 * np.sum(action ** 2)
+    - 0.001 * np.sum((action - previous_action) ** 2)
+)
 
-# 到达附近: 额外奖励
-if distance < 0.05:
-    reward += 10.0
-
-# 非常精确: 超大奖励
 if distance < 0.02:
-    reward += 50.0
+    reward += 10.0
 ```
 
 **奖励设计的技巧**：
@@ -571,54 +571,29 @@ reward = (
 )
 ```
 
-## 3.5 策略梯度（Demo 2 使用的算法）
+## 3.5 IK 引导的 TD3+BC（Demo 2 使用的算法）
 
-策略梯度是最基本的 RL 算法。核心思想：**如果一个动作获得了高回报，就增加执行这个动作的概率。**
+Demo 2 不再让策略从随机动作开始摸索，而是分三步训练：
 
 ```
-算法步骤:
-1. 用当前策略 π 收集一批经验 (s, a, r)
-2. 计算每个时刻的回报 G_t
-3. 计算策略梯度:
-   ∇J = Σ (∇log π(a|s) · G_t)
-       "高回报的动作 → 增大概率"
-       "低回报的动作 → 减小概率"
-4. 更新策略: θ = θ + α · ∇J
-
-用大白话说:
-  "做了一个动作，结果很好 → 下次更可能这么做"
-  "做了一个动作，结果不好 → 下次更不可能这么做"
+1. 行为克隆: IK 为随机目标生成专家动作，策略先模仿老师
+2. DAgger: 让策略自己运行，并在它容易犯错的状态上重新查询 IK
+3. TD3+BC 微调: 关闭 IK 动作，利用经验回放和专家约束强化策略
 ```
 
-Demo 2 的训练代码：
+IK 教师动作由当前关节角和 IK 解之间的差得到：
 
 ```python
-# 收集一轮经验
-for step in range(200):
-    action = policy(obs)                  # 策略输出动作
-    noise = torch.randn_like(action)      # 添加探索噪声
-    noisy_action = action + noise
-    log_prob = -0.5 * (noise ** 2).sum()  # 记录概率
-    obs, reward, done, _ = env.step(noisy_action)
-
-# 计算回报
-returns = []
-R = 0
-for r in reversed(rewards):
-    R = r + 0.99 * R          # 折扣累积
-    returns.insert(0, R)
-
-# 策略梯度更新
-loss = 0
-for log_prob, R in zip(log_probs, returns):
-    loss -= log_prob * R       # 高回报 → 增大该动作概率
-
-optimizer.zero_grad()
-loss.backward()                # 反向传播计算梯度
-optimizer.step()               # 更新网络权重
+q_ik = calculateInverseKinematics(robot, ee_link, target)
+teacher_action = clip((q_ik - current_q) / action_scale, -1, 1)
 ```
 
-## 3.6 PPO（生产级算法）
+TD3 是面向连续动作的 off-policy 算法。它会把经历保存到 replay buffer，
+因此同一条仿真经验可以用于多次网络更新，样本利用率高于每条轨迹只使用
+一次的基础策略梯度。TD3+BC 在 actor 更新中继续保留逐步衰减的 IK 模仿
+约束，防止尚不准确的 critic 破坏预训练策略。最终评估只运行 RL，不调用 IK。
+
+## 3.6 PPO（另一种生产级算法）
 
 PPO (Proximal Policy Optimization) 是当前**最常用**的 RL 算法，也是宇树训练 G1 走路用的算法。它在策略梯度的基础上做了一个关键改进：
 
@@ -637,14 +612,14 @@ PPO 的解决方案:
   直觉: "每次更新，新策略不能偏离旧策略太远"
 ```
 
-**PPO vs 策略梯度**：
+**TD3+BC vs PPO**：
 
-| 维度 | 策略梯度 (Demo 2) | PPO |
-|------|------------------|-----|
-| 更新稳定性 | 不稳定，经常崩溃 | 稳定，不容易崩 |
-| 样本效率 | 低（需要更多数据） | 较高 |
-| 超参数敏感性 | 高 | 低 |
-| 实际应用 | 教学用 | 工业标准 |
+| 维度 | TD3+BC (Demo 2) | PPO |
+|------|-------------|-----|
+| 数据使用 | off-policy，有经验回放 | on-policy，新策略收集新数据 |
+| 单环境样本效率 | 高 | 中 |
+| 并行环境吞吐 | 中 | 高 |
+| 动作空间 | 连续动作 | 连续或离散动作 |
 
 ## 3.7 探索与利用
 
@@ -656,10 +631,9 @@ PPO 的解决方案:
 如果只利用: 可能陷入局部最优（比如原地不动也不会摔倒）
 
 Demo 2 的探索策略:
-  action = policy(obs) + noise * scale    # 在策略输出上加噪声
-  scale = 0.3 * (1 - episode/total)       # 噪声随训练逐渐减小
-  # 早期: 大量探索（噪声大）
-  # 后期: 主要利用（噪声小）
+  TD3 在策略动作上加入有界高斯噪声
+  BC 约束随训练逐步减弱
+  评估时使用 deterministic=True，关闭探索噪声
 ```
 
 ---
@@ -967,10 +941,10 @@ RL 的目标: 找到 π* 使 J(π*) 最大
   ☐ 把稀疏奖励(只在到达时+1)和稠密奖励对比
   ☐ 改变网络大小(64/256 hidden)，观察影响
 
-第 3 周: PPO 算法
+第 3 周: TD3 / PPO 算法
 ━━━━━━━━━━━━━━━━━━━━━━━━
-  ☐ 安装 stable-baselines3 (pip install stable-baselines3)
-  ☐ 用 PPO 替换 Demo 2 的策略梯度，对比效果
+  ☐ 理解 Demo 2 的 TD3 经验回放和延迟 actor 更新
+  ☐ 用 PPO 替换 TD3+BC，对比样本效率
   ☐ 理解 clip ratio 和 value function
 
 第 4 周: 宇树 RL 实战
@@ -1004,5 +978,6 @@ RL 的目标: 找到 π* 使 J(π*) 最大
 | URDF | 能读懂一个简单 URDF 的关节定义 | 打开 Kuka 的 URDF 文件 |
 | RL 循环 | 画出 Agent-Environment 交互图 | 默写 |
 | 奖励设计 | 给"走路"任务设计合理的奖励函数 | 修改 Demo 2 |
-| 策略梯度 | 解释"高回报动作增大概率"的直觉 | 读 Demo 2 训练代码 |
-| PPO | 解释为什么要 clip ratio | 用 SB3 跑 Demo 2 |
+| 行为克隆 | 解释 IK 示范如何帮助策略冷启动 | 读 Demo 2 数据采集代码 |
+| TD3+BC | 解释经验回放和专家约束的作用 | 读 Demo 2 训练代码 |
+| PPO | 解释为什么要 clip ratio | 用 PPO 替换 TD3+BC 对比 |
