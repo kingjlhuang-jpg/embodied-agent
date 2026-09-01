@@ -6,7 +6,8 @@
 Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── Gymnasium (RL接口)
                     │                        │
                     │                        ├── trained_policy.zip (到达模型)
-                    │                        └── grasp_policy.zip (抓取模型)
+                    │                        ├── grasp_policy.zip (抓取模型)
+                    │                        └── robust_grasp_policy.zip (鲁棒抓取模型)
                     │
                     ├── Bullet 物理引擎 (碰撞/重力/摩擦/力矩)
                     ├── SDF 机器人模型 (Kuka iiwa + WSG50 夹爪)
@@ -30,6 +31,7 @@ Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── 
 |------|--------|------|------|------|
 | **MLP 策略网络 / reach** | 19K | 关节角度+位置(13维) | 手臂关节增量(7维) | 到达基准 |
 | **MLP 策略网络 / grasp** | 约74K | 关节+夹爪+方块+接触+抓取状态(24维) | 手臂7维+夹爪1维 | 接触抓取 |
+| **MLP 策略网络 / robust grasp** | 约78K | grasp状态+最近2步动作(40维) | 手臂7维+夹爪1维 | 延迟/物理随机化抓取 |
 | **EEGNet / CNN** | 100K-1M | RGB 图像 | 动作 | 视觉感知 |
 | **RT-2** (Google) | 55B | 图像+语言 | 动作token | VLA 先驱 |
 | **OpenVLA** (Stanford) | 7B | 图像+语言 | 动作 | 开源 VLA |
@@ -63,7 +65,7 @@ Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── 
 | `p.setJointMotorControl2()` | 发布 `/arm/commands` | 指令目标：仿真器 → CAN总线 |
 | `p.stepSimulation()` | 删除 | 真实世界自动运行 |
 | `env.reset()` | 人工复位 | 真实世界没有重置按钮 |
-| `trained_policy.zip` / `grasp_policy.zip` | **直接复用** | 观测和动作接口一致时模型不变 |
+| `trained_policy.zip` / `grasp_policy.zip` / `robust_grasp_policy.zip` | **直接复用** | 观测和动作接口一致时模型不变；鲁棒抓取需维护2步动作历史 |
 
 ## 关键概念索引
 
@@ -77,5 +79,7 @@ Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── 
 | **奖励设计** | Demo 2 | 靠近 < 双侧接触 < 抬升 < 稳定保持 |
 | **IK 引导训练** | Demo 2 | 阶段平衡行为克隆 + DAgger 加速冷启动 |
 | **TD3+BC** | Demo 2 | 经验回放 + Q-filter IK 约束的连续动作强化学习 |
+| **域随机化** | Demo 2 | 随机尺寸/质量/摩擦/电机/噪声/延迟，1000回合盲测 |
+| **保守残差微调** | Demo 2 | 冻结24维基线，只学习16维动作历史输入并保护最佳检查点 |
 | **模型部署** | Demo 3 | 加载 Stable-Baselines3 模型运行 |
 | **Sim-to-Real** | Demo 3 | 仿真训练 → 真机运行，模型不变 |

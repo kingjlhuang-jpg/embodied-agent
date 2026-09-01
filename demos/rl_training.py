@@ -301,7 +301,15 @@ class GuidedTD3(TD3):
         self._expert_actions: torch.Tensor | None = None
         self._expert_phase_indices: list[torch.Tensor] = []
         self._bc_action_weights: torch.Tensor | None = None
+        self._reference_actions: torch.Tensor | None = None
         self._q_filter = False
+        self._hold_state_index: int | None = None
+        self._hold_action_index: int | None = None
+        self._hold_target = 1.0
+        self._hold_coefficient = 0.0
+        self._anchor_coefficient = 0.0
+        self._actor_trainable_suffix_start: int | None = None
+        self.actor_learning_rate: float | None = None
         self._bc_start = 1.0
         self._bc_end = 0.25
         self._bc_decay_updates = 50_000
@@ -317,6 +325,12 @@ class GuidedTD3(TD3):
         balance_phases: bool = False,
         action_weights: np.ndarray | None = None,
         q_filter: bool = False,
+        hold_state_index: int | None = None,
+        hold_action_index: int | None = None,
+        hold_target: float = 1.0,
+        hold_coefficient: float = 0.0,
+        anchor_coefficient: float = 0.0,
+        actor_trainable_suffix_start: int | None = None,
     ) -> None:
         self._expert_observations = torch.as_tensor(
             demonstrations.observations, device=self.device)
@@ -337,6 +351,31 @@ class GuidedTD3(TD3):
         self._bc_action_weights = torch.as_tensor(
             weights / max(float(weights.mean()), 1e-6), device=self.device)
         self._q_filter = bool(q_filter)
+        if (hold_state_index is None) != (hold_action_index is None):
+            raise ValueError(
+                "hold_state_index and hold_action_index must be set together")
+        if hold_state_index is not None:
+            if not 0 <= hold_state_index < demonstrations.observations.shape[1]:
+                raise ValueError("hold_state_index is outside the observation")
+            if not 0 <= hold_action_index < demonstrations.teacher_actions.shape[1]:
+                raise ValueError("hold_action_index is outside the action")
+        self._hold_state_index = hold_state_index
+        self._hold_action_index = hold_action_index
+        self._hold_target = float(hold_target)
+        self._hold_coefficient = max(float(hold_coefficient), 0.0)
+        self._anchor_coefficient = max(float(anchor_coefficient), 0.0)
+        if (
+            actor_trainable_suffix_start is not None
+            and not 0 <= actor_trainable_suffix_start < demonstrations.observations.shape[1]
+        ):
+            raise ValueError(
+                "actor_trainable_suffix_start is outside the observation")
+        self._actor_trainable_suffix_start = actor_trainable_suffix_start
+        self._reference_actions = None
+        if self._anchor_coefficient > 0.0:
+            with torch.no_grad():
+                self._reference_actions = self.actor(
+                    self._expert_observations).detach().clone()
         self._bc_start = start
         self._bc_end = end
         self._bc_decay_updates = max(decay_updates, 1)
@@ -347,9 +386,14 @@ class GuidedTD3(TD3):
 
         self.policy.set_training_mode(True)
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
+        if self.actor_learning_rate is not None:
+            for parameter_group in self.actor.optimizer.param_groups:
+                parameter_group["lr"] = self.actor_learning_rate
         actor_losses = []
         critic_losses = []
         bc_losses = []
+        hold_losses = []
+        anchor_losses = []
         q_filter_fractions = []
 
         for _ in range(gradient_steps):
@@ -418,6 +462,11 @@ class GuidedTD3(TD3):
                     )
                 expert_observations = self._expert_observations[expert_indices]
                 expert_actions = self._expert_actions[expert_indices]
+                reference_actions = (
+                    self._reference_actions[expert_indices]
+                    if self._reference_actions is not None
+                    else None
+                )
                 expert_predictions = self.actor(
                     expert_observations)
                 element_losses = F.smooth_l1_loss(
@@ -450,14 +499,76 @@ class GuidedTD3(TD3):
                     self._bc_start
                     + progress * (self._bc_end - self._bc_start)
                 )
-                actor_loss = rl_loss + bc_coefficient * bc_loss
+                hold_loss = torch.zeros((), device=self.device)
+                if (
+                    self._hold_state_index is not None
+                    and self._hold_action_index is not None
+                    and self._hold_coefficient > 0.0
+                ):
+                    replay_hold_mask = (
+                        replay_data.observations[:, self._hold_state_index] > 0.5)
+                    expert_hold_mask = (
+                        expert_observations[:, self._hold_state_index] > 0.5)
+                    # Q-filtering is useful during approach, but an immature
+                    # critic can incorrectly reject the teacher precisely
+                    # after contact.  Keep an unfiltered imitation anchor for
+                    # the complete lift action in known grasp states.
+                    if bool(expert_hold_mask.any()):
+                        expert_hold_losses = F.smooth_l1_loss(
+                            expert_predictions[expert_hold_mask],
+                            expert_actions[expert_hold_mask],
+                            reduction="none",
+                        )
+                        if self._bc_action_weights is not None:
+                            expert_hold_losses = (
+                                expert_hold_losses * self._bc_action_weights)
+                        hold_loss = hold_loss + expert_hold_losses.mean()
+
+                    # Replay states are not labelled by IK, but closing the
+                    # gripper is always safe after the grasp latch is active.
+                    if bool(replay_hold_mask.any()):
+                        hold_predictions = policy_actions[
+                            replay_hold_mask, self._hold_action_index]
+                        hold_targets = torch.full_like(
+                            hold_predictions, self._hold_target)
+                        hold_loss = hold_loss + F.smooth_l1_loss(
+                            hold_predictions, hold_targets)
+                anchor_loss = torch.zeros((), device=self.device)
+                if (
+                    reference_actions is not None
+                    and self._anchor_coefficient > 0.0
+                ):
+                    anchor_elements = F.smooth_l1_loss(
+                        expert_predictions, reference_actions, reduction="none")
+                    if self._bc_action_weights is not None:
+                        anchor_elements = anchor_elements * self._bc_action_weights
+                    anchor_loss = anchor_elements.mean()
+                actor_loss = (
+                    rl_loss
+                    + bc_coefficient * bc_loss
+                    + self._hold_coefficient * hold_loss
+                    + self._anchor_coefficient * anchor_loss
+                )
 
                 self.actor.optimizer.zero_grad()
                 actor_loss.backward()
+                if self._actor_trainable_suffix_start is not None:
+                    first_weight = self.actor.mu[0].weight
+                    for parameter in self.actor.parameters():
+                        if parameter.grad is None:
+                            continue
+                        if parameter is first_weight:
+                            parameter.grad[
+                                :, :self._actor_trainable_suffix_start
+                            ].zero_()
+                        else:
+                            parameter.grad.zero_()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                 self.actor.optimizer.step()
                 actor_losses.append(actor_loss.item())
                 bc_losses.append(bc_loss.item())
+                hold_losses.append(hold_loss.item())
+                anchor_losses.append(anchor_loss.item())
 
                 polyak_update(
                     self.critic.parameters(), self.critic_target.parameters(), self.tau)
@@ -480,11 +591,34 @@ class GuidedTD3(TD3):
             self.logger.record("train/actor_loss", float(np.mean(actor_losses)))
             self.logger.record("train/ik_bc_loss", float(np.mean(bc_losses)))
             self.logger.record("train/rl_weight", self.rl_weight)
+            self.logger.record(
+                "train/hold_action_loss", float(np.mean(hold_losses)))
+            self.logger.record(
+                "train/reference_anchor_loss", float(np.mean(anchor_losses)))
             if q_filter_fractions:
                 self.logger.record(
                     "train/q_filter_fraction",
                     float(np.mean(q_filter_fractions)),
                 )
+
+    def reference_action_drift(self) -> dict[str, float]:
+        """Measure actor drift from the policy captured before online RL."""
+
+        if self._expert_observations is None or self._reference_actions is None:
+            return {"mean": 0.0, "p95": 0.0, "max": 0.0}
+        differences = []
+        with torch.no_grad():
+            for start in range(0, len(self._expert_observations), 2_048):
+                observations = self._expert_observations[start:start + 2_048]
+                references = self._reference_actions[start:start + 2_048]
+                differences.append(
+                    (self.actor(observations) - references).abs().cpu())
+        values = torch.cat(differences).numpy()
+        return {
+            "mean": float(np.mean(values)),
+            "p95": float(np.percentile(values, 95)),
+            "max": float(np.max(values)),
+        }
 
     def _excluded_save_params(self) -> list[str]:
         return super()._excluded_save_params() + [
@@ -492,6 +626,7 @@ class GuidedTD3(TD3):
             "_expert_actions",
             "_expert_phase_indices",
             "_bc_action_weights",
+            "_reference_actions",
         ]
 
 
@@ -919,6 +1054,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quick", action="store_true",
         help="run a small smoke test instead of convergence training")
+    parser.add_argument(
+        "--robust", action="store_true",
+        help="train grasping with physics, sensor, and latency randomization")
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument(
         "--check-env", action="store_true",
@@ -928,6 +1066,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.robust and args.task != "grasp":
+        raise SystemExit("--robust is only available with --task grasp")
     if args.task == "grasp":
         from grasp_training import (  # Imported lazily to avoid a cycle.
             GraspTrainingConfig,
@@ -936,18 +1076,28 @@ def main() -> None:
         )
 
         if args.check_env:
-            env = RobotGraspEnv()
+            env = RobotGraspEnv(
+                randomization=1.0 if args.robust else 0.0,
+                observe_action_history=args.robust,
+            )
             try:
                 check_env(env, warn=True)
                 print("Grasping Gymnasium environment check passed.")
             finally:
                 env.close()
             return
-        config = (
-            GraspTrainingConfig.quick(args.seed)
-            if args.quick
-            else GraspTrainingConfig(seed=args.seed)
-        )
+        if args.robust:
+            config = (
+                GraspTrainingConfig.quick_robust(args.seed)
+                if args.quick
+                else GraspTrainingConfig.robust(args.seed)
+            )
+        else:
+            config = (
+                GraspTrainingConfig.quick(args.seed)
+                if args.quick
+                else GraspTrainingConfig(seed=args.seed)
+            )
         train_grasp(config)
         return
     if args.check_env:

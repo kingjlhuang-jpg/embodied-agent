@@ -62,6 +62,7 @@ TD3+BC 强化学习微调。IK 只在训练阶段担任老师，最终评估和�
 ```python
 # reach: 13维观测 → 7个手臂关节
 # grasp: 24维观测 → 7个手臂关节 + 1个夹爪开合
+# robust grasp: 再加入最近2步动作历史，共40维观测
 action = policy_network(obs)         # 决策（AI 推理）
 env.step(action)                     # 执行并计算接触/抬升奖励
 ```
@@ -74,6 +75,12 @@ python demos/02_rl_training.py --task grasp
 
 # 快速验证完整流水线（不用于判断最终收敛）
 python demos/02_rl_training.py --task grasp --quick
+
+# 域随机化鲁棒训练（最终自动运行1000回合盲测）
+python demos/02_rl_training.py --task grasp --robust
+
+# 快速验证鲁棒训练流水线
+python demos/02_rl_training.py --task grasp --robust --quick
 ```
 
 抓取奖励按任务阶段递增：靠近方块获得小奖励，左右手指同时接触获得中等奖励，
@@ -85,6 +92,13 @@ PyBullet 夹爪在接触后数值打滑，环境只在检测到双侧真实碰�
 克隆权重，并用 Q-filter 只在 IK 动作优于当前策略时施加教师约束。固定种子的
 本地参考训练在最终 100 回合独立测试中达到 98%，随后三个互不重叠的 100
 回合验证集分别达到 98%、99%、99%；评估阶段均不调用 IK。
+
+`--robust` 会在每个回合随机化方块尺寸（4–6 cm）、质量（20–80 g）、
+摩擦、朝向、夹爪摩擦、电机力/速度，并加入观测噪声、动作噪声和 0–2 步
+控制延迟。鲁棒策略可利用最近两步动作历史学习延迟补偿；原 24 维策略会无损扩展为
+40 维网络，旧通道被冻结，只训练新增的历史残差权重。训练使用最佳检查点保护，
+未超过基线的候选不会覆盖模型。固定种子的 1000 回合全随机化盲测结果为
+938/1000（93.8%），其中 0/1/2 步延迟成功率分别为 95.8%/93.9%/91.7%。
 
 ### Demo 3: 模型部署
 
@@ -100,6 +114,7 @@ env.step(action)                         ros_node.send_cmd(action)
 ```bash
 python demos/03_deploy_model.py --task reach
 python demos/03_deploy_model.py --task grasp
+python demos/03_deploy_model.py --task grasp --robust
 ```
 
 ### Demo 4: 宇树 G1 人形机器人动作

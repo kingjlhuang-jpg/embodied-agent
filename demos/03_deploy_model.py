@@ -21,11 +21,15 @@ from stable_baselines3 import TD3
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 复用训练时的环境定义
-from grasp_training import GRASP_MODEL_PATH, RobotGraspEnv
+from grasp_training import (
+    GRASP_MODEL_PATH,
+    ROBUST_GRASP_MODEL_PATH,
+    RobotGraspEnv,
+)
 from rl_training import MODEL_PATH, RobotArmEnv
 
 
-def deploy_in_simulation(task="reach"):
+def deploy_in_simulation(task="reach", *, robust=False):
     """在仿真中部署AI模型"""
     print("=" * 60)
     print("  部署AI模型到仿真机器人")
@@ -33,7 +37,11 @@ def deploy_in_simulation(task="reach"):
     print()
 
     # 1. 加载训练好的 TD3+BC 模型
-    model_path = GRASP_MODEL_PATH if task == "grasp" else MODEL_PATH
+    model_path = (
+        ROBUST_GRASP_MODEL_PATH
+        if task == "grasp" and robust
+        else GRASP_MODEL_PATH if task == "grasp" else MODEL_PATH
+    )
     try:
         policy = TD3.load(model_path, device="auto")
         print(f"[OK] 已加载模型: {model_path}")
@@ -45,7 +53,11 @@ def deploy_in_simulation(task="reach"):
     # 2. 创建仿真环境（带3D可视化）
     print("[OK] 创建仿真环境（带可视化窗口）...")
     env = (
-        RobotGraspEnv(render=True)
+        RobotGraspEnv(
+            render=True,
+            randomization=1.0 if robust else 0.0,
+            observe_action_history=robust,
+        )
         if task == "grasp"
         else RobotArmEnv(render=True)
     )
@@ -137,10 +149,15 @@ def parse_args():
         description="Deploy the reaching or grasping TD3 policy in PyBullet.")
     parser.add_argument(
         "--task", choices=("reach", "grasp"), default="reach")
+    parser.add_argument(
+        "--robust", action="store_true",
+        help="deploy the domain-randomized grasp model and environment")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.robust and args.task != "grasp":
+        raise SystemExit("--robust is only available with --task grasp")
     show_deployment_comparison()
-    deploy_in_simulation(args.task)
+    deploy_in_simulation(args.task, robust=args.robust)

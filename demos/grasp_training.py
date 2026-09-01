@@ -46,11 +46,16 @@ GRIPPER_OPEN_ANGLE = 0.30
 GRIPPER_CLOSED_ANGLE = -0.02
 GRASP_CENTER_Z_OFFSET = 0.005
 TEACHER_LIFT_HEIGHT = 0.08
+BASE_OBSERVATION_SIZE = 24
+ACTION_HISTORY_STEPS = 2
 GRASP_BC_ACTION_WEIGHTS = np.array([1.0] * 7 + [4.0], dtype=np.float32)
 
 GRASP_MODEL_PATH = Path("grasp_policy.zip")
 BEST_GRASP_MODEL_PATH = Path("best_grasp_policy.zip")
 GRASP_METRICS_PATH = Path("grasp_training_metrics.json")
+ROBUST_GRASP_MODEL_PATH = Path("robust_grasp_policy.zip")
+BEST_ROBUST_GRASP_MODEL_PATH = Path("best_robust_grasp_policy.zip")
+ROBUST_GRASP_METRICS_PATH = Path("robust_grasp_training_metrics.json")
 
 
 @dataclass(frozen=True)
@@ -66,9 +71,16 @@ class GraspTrainingConfig:
     critic_warmup_steps: int = 3_000
     rl_phase_steps: tuple[int, ...] = (15_000, 25_000, 40_000)
     curriculum: tuple[float, ...] = (1.00, 1.00, 1.00)
+    randomization_curriculum: tuple[float, ...] = (0.0, 0.0, 0.0)
     eval_episodes: int = 50
     final_eval_episodes: int = 100
     target_success_rate: float = 0.95
+    rl_weight: float = 0.01
+    bc_start: float = 1.2
+    bc_end: float = 0.30
+    hold_coefficient: float = 1.0
+    anchor_coefficient: float = 0.0
+    actor_learning_rate: float | None = None
 
     @classmethod
     def quick(cls, seed: int = 20260901) -> "GraspTrainingConfig":
@@ -84,9 +96,62 @@ class GraspTrainingConfig:
             critic_warmup_steps=75,
             rl_phase_steps=(750,),
             curriculum=(0.35,),
+            randomization_curriculum=(0.0,),
             eval_episodes=10,
             final_eval_episodes=20,
             target_success_rate=1.0,
+        )
+
+    @classmethod
+    def robust(cls, seed: int = 20260901) -> "GraspTrainingConfig":
+        """Full-domain training and a 1,000-episode held-out evaluation."""
+
+        return cls(
+            seed=seed,
+            expert_steps=20_000,
+            bc_epochs=0,
+            dagger_iterations=3,
+            dagger_steps=4_000,
+            dagger_epochs=0,
+            critic_warmup_steps=2_000,
+            rl_phase_steps=(10_000, 15_000, 25_000),
+            curriculum=(1.0, 1.0, 1.0),
+            randomization_curriculum=(0.35, 0.70, 1.0),
+            eval_episodes=75,
+            final_eval_episodes=1_000,
+            target_success_rate=0.95,
+            rl_weight=0.002,
+            bc_start=0.20,
+            bc_end=0.05,
+            hold_coefficient=5.0,
+            anchor_coefficient=20.0,
+            actor_learning_rate=1e-6,
+        )
+
+    @classmethod
+    def quick_robust(cls, seed: int = 20260901) -> "GraspTrainingConfig":
+        """Smoke-test the randomized pipeline without claiming convergence."""
+
+        return cls(
+            seed=seed,
+            expert_steps=2_000,
+            bc_epochs=0,
+            dagger_iterations=1,
+            dagger_steps=1_000,
+            dagger_epochs=0,
+            critic_warmup_steps=100,
+            rl_phase_steps=(1_000,),
+            curriculum=(1.0,),
+            randomization_curriculum=(0.35,),
+            eval_episodes=10,
+            final_eval_episodes=20,
+            target_success_rate=1.0,
+            rl_weight=0.002,
+            bc_start=0.20,
+            bc_end=0.05,
+            hold_coefficient=5.0,
+            anchor_coefficient=20.0,
+            actor_learning_rate=1e-6,
         )
 
 
@@ -116,6 +181,8 @@ class RobotGraspEnv(gym.Env):
         *,
         render: bool | None = None,
         difficulty: float = 1.0,
+        randomization: float = 0.0,
+        observe_action_history: bool = False,
         max_steps: int = 300,
     ):
         super().__init__()
@@ -126,10 +193,15 @@ class RobotGraspEnv(gym.Env):
 
         self.render_mode = render_mode
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        self.randomization = float(np.clip(randomization, 0.0, 1.0))
+        self.observe_action_history = bool(observe_action_history)
         self.max_steps = int(max_steps)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(8,), dtype=np.float32)
+        observation_size = BASE_OBSERVATION_SIZE
+        if self.observe_action_history:
+            observation_size += ACTION_HISTORY_STEPS * self.action_space.shape[0]
         self.observation_space = spaces.Box(
-            -5.0, 5.0, shape=(24,), dtype=np.float32)
+            -5.0, 5.0, shape=(observation_size,), dtype=np.float32)
 
         mode = p.GUI if render_mode == "human" else p.DIRECT
         self.client = p.connect(mode)
@@ -153,6 +225,20 @@ class RobotGraspEnv(gym.Env):
         self.previous_distance = 0.0
         self.previous_cube_height = CUBE_REST_Z
         self.previous_action = np.zeros(8, dtype=np.float32)
+        self.command_history = np.zeros(
+            (ACTION_HISTORY_STEPS, 8), dtype=np.float32)
+        self.action_buffer: list[np.ndarray] = []
+        self.action_delay_steps = 0
+        self.action_noise_std = np.zeros(8, dtype=np.float32)
+        self.observation_bias = np.zeros(20, dtype=np.float32)
+        self.observation_noise_std = 0.0
+        self.cube_half_extent = CUBE_HALF_EXTENT
+        self.cube_mass = 0.03
+        self.cube_friction = 2.5
+        self.cube_yaw = 0.0
+        self.finger_friction = 3.0
+        self.motor_force = 300.0
+        self.motor_velocity = 1.5
         self.gripper_command = -1.0
         self.joint_lower = np.full(7, -np.pi, dtype=np.float64)
         self.joint_upper = np.full(7, np.pi, dtype=np.float64)
@@ -170,9 +256,15 @@ class RobotGraspEnv(gym.Env):
     def set_difficulty(self, difficulty: float) -> None:
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
 
+    def set_randomization(self, randomization: float) -> None:
+        """Set domain-randomization severity for subsequent resets."""
+
+        self.randomization = float(np.clip(randomization, 0.0, 1.0))
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         del options
+        self._sample_domain_parameters()
 
         p.resetSimulation(physicsClientId=self.client)
         p.setGravity(0, 0, -9.81, physicsClientId=self.client)
@@ -222,7 +314,7 @@ class RobotGraspEnv(gym.Env):
             p.changeDynamics(
                 self.robot_id,
                 link,
-                lateralFriction=3.0,
+                lateralFriction=self.finger_friction,
                 spinningFriction=0.15,
                 rollingFriction=0.01,
                 physicsClientId=self.client,
@@ -230,29 +322,34 @@ class RobotGraspEnv(gym.Env):
 
         cube_x = 0.40 + self.difficulty * self.np_random.uniform(-0.055, 0.055)
         cube_y = self.difficulty * self.np_random.uniform(-0.075, 0.075)
-        cube_position = np.array([cube_x, cube_y, CUBE_REST_Z])
+        cube_position = np.array([
+            cube_x,
+            cube_y,
+            TABLE_TOP_Z + self.cube_half_extent,
+        ])
         cube_collision = p.createCollisionShape(
             p.GEOM_BOX,
-            halfExtents=[CUBE_HALF_EXTENT] * 3,
+            halfExtents=[self.cube_half_extent] * 3,
             physicsClientId=self.client,
         )
         cube_visual = p.createVisualShape(
             p.GEOM_BOX,
-            halfExtents=[CUBE_HALF_EXTENT] * 3,
+            halfExtents=[self.cube_half_extent] * 3,
             rgbaColor=[0.9, 0.05, 0.05, 1.0],
             physicsClientId=self.client,
         )
         self.cube_id = p.createMultiBody(
-            baseMass=0.03,
+            baseMass=self.cube_mass,
             baseCollisionShapeIndex=cube_collision,
             baseVisualShapeIndex=cube_visual,
             basePosition=cube_position,
+            baseOrientation=p.getQuaternionFromEuler([0.0, 0.0, self.cube_yaw]),
             physicsClientId=self.client,
         )
         p.changeDynamics(
             self.cube_id,
             -1,
-            lateralFriction=2.5,
+            lateralFriction=self.cube_friction,
             spinningFriction=0.1,
             rollingFriction=0.001,
             restitution=0.0,
@@ -264,6 +361,11 @@ class RobotGraspEnv(gym.Env):
         self.hold_steps = 0
         self.gripper_command = -1.0
         self.previous_action.fill(0.0)
+        self.command_history.fill(0.0)
+        self.action_buffer = [
+            np.zeros(8, dtype=np.float32)
+            for _ in range(self.action_delay_steps)
+        ]
         for _ in range(20):
             self._hold_ready_pose()
             self._set_gripper(-1.0)
@@ -282,6 +384,17 @@ class RobotGraspEnv(gym.Env):
         if action.shape != self.action_space.shape:
             raise ValueError(f"expected action shape (8,), got {action.shape}")
         action = np.clip(action, -1.0, 1.0)
+        self.command_history[:-1] = self.command_history[1:]
+        self.command_history[-1] = action
+        self.action_buffer.append(action.copy())
+        action = self.action_buffer.pop(0)
+        if np.any(self.action_noise_std):
+            action = np.clip(
+                action + self.np_random.normal(
+                    0.0, self.action_noise_std, size=action.shape),
+                -1.0,
+                1.0,
+            ).astype(np.float32)
 
         released_cube = False
         if self.is_grasped and action[7] < -0.5:
@@ -297,8 +410,8 @@ class RobotGraspEnv(gym.Env):
                 joint,
                 p.POSITION_CONTROL,
                 targetPosition=float(target),
-                force=300,
-                maxVelocity=1.5,
+                force=self.motor_force,
+                maxVelocity=self.motor_velocity,
                 physicsClientId=self.client,
             )
         self._set_gripper(float(action[7]))
@@ -433,6 +546,35 @@ class RobotGraspEnv(gym.Env):
             return 1
         return 0
 
+    def _sample_domain_parameters(self) -> None:
+        """Sample one reproducible physics/sensor domain for this episode."""
+
+        severity = self.randomization
+
+        def blend(base: float, low: float, high: float) -> float:
+            sampled = float(self.np_random.uniform(low, high))
+            return (1.0 - severity) * base + severity * sampled
+
+        self.cube_half_extent = blend(CUBE_HALF_EXTENT, 0.020, 0.030)
+        self.cube_mass = blend(0.03, 0.02, 0.08)
+        self.cube_friction = blend(2.5, 0.8, 3.5)
+        self.cube_yaw = severity * float(
+            self.np_random.uniform(-math.pi / 4, math.pi / 4))
+        self.finger_friction = blend(3.0, 1.5, 4.0)
+        self.motor_force = blend(300.0, 240.0, 360.0)
+        self.motor_velocity = blend(1.5, 1.2, 1.8)
+
+        max_delay = int(math.ceil(2.0 * severity)) if severity > 0 else 0
+        self.action_delay_steps = int(
+            self.np_random.integers(0, max_delay + 1))
+        self.action_noise_std = np.array(
+            [0.012 * severity] * 7 + [0.025 * severity],
+            dtype=np.float32,
+        )
+        self.observation_bias = self.np_random.normal(
+            0.0, 0.0015 * severity, size=20).astype(np.float32)
+        self.observation_noise_std = 0.0015 * severity
+
     def _prepare_ik_limits(self) -> None:
         self._ik_joints = []
         self._ik_lower = []
@@ -460,7 +602,8 @@ class RobotGraspEnv(gym.Env):
                 joint,
                 p.POSITION_CONTROL,
                 targetPosition=float(target),
-                force=300,
+                force=self.motor_force,
+                maxVelocity=self.motor_velocity,
                 physicsClientId=self.client,
             )
 
@@ -637,6 +780,15 @@ class RobotGraspEnv(gym.Env):
             grasp_state,
             lift_progress,
         ])
+        if self.observation_noise_std > 0:
+            observation[:20] += self.observation_bias
+            observation[:20] += self.np_random.normal(
+                0.0, self.observation_noise_std, size=20)
+        if self.observe_action_history:
+            observation = np.concatenate([
+                observation,
+                self.command_history.reshape(-1),
+            ])
         return np.clip(observation, -5.0, 5.0).astype(np.float32)
 
     def _info(self, distance: float) -> dict[str, float | bool]:
@@ -652,6 +804,12 @@ class RobotGraspEnv(gym.Env):
             "grasped": self.is_grasped,
             "is_success": bool(success),
             "difficulty": self.difficulty,
+            "randomization": self.randomization,
+            "cube_size": 2.0 * self.cube_half_extent,
+            "cube_mass": self.cube_mass,
+            "cube_friction": self.cube_friction,
+            "cube_yaw": self.cube_yaw,
+            "action_delay_steps": self.action_delay_steps,
         }
 
     def close(self):
@@ -689,16 +847,80 @@ def build_grasp_td3(env: RobotGraspEnv, seed: int) -> GuidedTD3:
     )
 
 
+def warm_start_grasp_model(
+    model: GuidedTD3,
+    source_path: Path,
+) -> None:
+    """Expand a 24-D grasp policy to action-history input without drift."""
+
+    source = GuidedTD3.load(source_path, device=model.device)
+    source_observation_size = int(source.observation_space.shape[0])
+    target_observation_size = int(model.observation_space.shape[0])
+    action_size = int(model.action_space.shape[0])
+    if source_observation_size == target_observation_size:
+        model.set_parameters(source_path, exact_match=True, device=model.device)
+        return
+    if (
+        source_observation_size != BASE_OBSERVATION_SIZE
+        or target_observation_size
+        != BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * action_size
+    ):
+        raise ValueError(
+            "unsupported grasp-policy observation expansion: "
+            f"{source_observation_size} -> {target_observation_size}"
+        )
+
+    def expand_actor(source_actor, target_actor) -> None:
+        source_state = source_actor.state_dict()
+        target_state = target_actor.state_dict()
+        for key, source_value in source_state.items():
+            if key == "mu.0.weight":
+                target_state[key].zero_()
+                target_state[key][:, :source_observation_size].copy_(source_value)
+            else:
+                target_state[key].copy_(source_value)
+        target_actor.load_state_dict(target_state)
+
+    def expand_critic(source_critic, target_critic) -> None:
+        source_state = source_critic.state_dict()
+        target_state = target_critic.state_dict()
+        first_layers = {"qf0.0.weight", "qf1.0.weight"}
+        for key, source_value in source_state.items():
+            if key in first_layers:
+                target_state[key].zero_()
+                target_state[key][:, :source_observation_size].copy_(
+                    source_value[:, :source_observation_size])
+                target_state[key][
+                    :, target_observation_size:target_observation_size + action_size
+                ].copy_(source_value[
+                    :, source_observation_size:source_observation_size + action_size
+                ])
+            else:
+                target_state[key].copy_(source_value)
+        target_critic.load_state_dict(target_state)
+
+    expand_actor(source.actor, model.actor)
+    expand_actor(source.actor_target, model.actor_target)
+    expand_critic(source.critic, model.critic)
+    expand_critic(source.critic_target, model.critic_target)
+
+
 def evaluate_grasp(
     model: TD3,
     *,
     episodes: int,
     seed: int,
     difficulty: float = 1.0,
+    randomization: float = 0.0,
 ) -> dict[str, float | int]:
     """Evaluate RL alone; IK is never called in this function."""
 
-    env = RobotGraspEnv(difficulty=difficulty)
+    env = RobotGraspEnv(
+        difficulty=difficulty,
+        randomization=randomization,
+        observe_action_history=(
+            int(model.observation_space.shape[0]) > BASE_OBSERVATION_SIZE),
+    )
     successes = 0
     grasps = 0
     bilateral_contacts = 0
@@ -706,9 +928,18 @@ def evaluate_grasp(
     lift_heights: list[float] = []
     minimum_distances: list[float] = []
     episode_steps: list[int] = []
+    cube_sizes: list[float] = []
+    cube_masses: list[float] = []
+    cube_frictions: list[float] = []
+    action_delays: list[int] = []
+    episode_successes: list[bool] = []
     try:
         for episode in range(episodes):
-            observation, _ = env.reset(seed=seed + episode)
+            observation, reset_info = env.reset(seed=seed + episode)
+            cube_sizes.append(float(reset_info["cube_size"]))
+            cube_masses.append(float(reset_info["cube_mass"]))
+            cube_frictions.append(float(reset_info["cube_friction"]))
+            action_delays.append(int(reset_info["action_delay_steps"]))
             best_lift = 0.0
             minimum_distance = float("inf")
             ever_grasped = False
@@ -728,6 +959,7 @@ def evaluate_grasp(
                 if terminated or truncated:
                     break
             successes += bool(info.get("is_success", False))
+            episode_successes.append(bool(info.get("is_success", False)))
             grasps += ever_grasped
             bilateral_contacts += ever_bilateral_contact
             approaches += minimum_distance < FINE_ALIGNMENT_DISTANCE
@@ -737,18 +969,38 @@ def evaluate_grasp(
     finally:
         env.close()
 
-    return {
+    result: dict[str, float | int] = {
         "episodes": episodes,
         "successes": int(successes),
         "success_rate": successes / episodes,
         "grasp_rate": grasps / episodes,
+        "drop_rate": (grasps - successes) / episodes,
         "bilateral_contact_rate": bilateral_contacts / episodes,
         "approach_rate": approaches / episodes,
         "mean_min_distance_m": float(np.mean(minimum_distances)),
         "mean_lift_height_m": float(np.mean(lift_heights)),
         "p95_lift_height_m": float(np.percentile(lift_heights, 95)),
         "mean_steps": float(np.mean(episode_steps)),
+        "randomization": randomization,
+        "cube_size_min_m": float(np.min(cube_sizes)),
+        "cube_size_max_m": float(np.max(cube_sizes)),
+        "cube_mass_min_kg": float(np.min(cube_masses)),
+        "cube_mass_max_kg": float(np.max(cube_masses)),
+        "cube_friction_min": float(np.min(cube_frictions)),
+        "cube_friction_max": float(np.max(cube_frictions)),
+        "action_delay_max_steps": int(np.max(action_delays)),
     }
+    delay_array = np.asarray(action_delays)
+    success_array = np.asarray(episode_successes, dtype=np.float32)
+    for delay in range(3):
+        delay_mask = delay_array == delay
+        result[f"delay_{delay}_episodes"] = int(delay_mask.sum())
+        result[f"delay_{delay}_success_rate"] = (
+            float(success_array[delay_mask].mean())
+            if bool(delay_mask.any())
+            else 0.0
+        )
+    return result
 
 
 def print_grasp_evaluation(label: str, metrics: dict[str, float | int]) -> None:
@@ -758,10 +1010,22 @@ def print_grasp_evaluation(label: str, metrics: dict[str, float | int]) -> None:
         f"接近率={metrics['approach_rate']:.1%} | "
         f"双指接触率={metrics['bilateral_contact_rate']:.1%} | "
         f"夹住率={metrics['grasp_rate']:.1%} | "
+        f"掉落率={metrics['drop_rate']:.1%} | "
         f"平均抬高={metrics['mean_lift_height_m'] * 100:.1f}cm | "
         f"平均步数={metrics['mean_steps']:.1f}",
         flush=True,
     )
+    if float(metrics.get("randomization", 0.0)) > 0.0:
+        print(
+            "      延迟分层："
+            f"0步={metrics['delay_0_success_rate']:.1%} "
+            f"({metrics['delay_0_episodes']}轮) | "
+            f"1步={metrics['delay_1_success_rate']:.1%} "
+            f"({metrics['delay_1_episodes']}轮) | "
+            f"2步={metrics['delay_2_success_rate']:.1%} "
+            f"({metrics['delay_2_episodes']}轮)",
+            flush=True,
+        )
 
 
 def grasp_checkpoint_score(
@@ -779,21 +1043,51 @@ def grasp_checkpoint_score(
 
 
 def train_grasp(config: GraspTrainingConfig) -> dict:
+    robust = max(config.randomization_curriculum, default=0.0) > 0.0
+    model_path = ROBUST_GRASP_MODEL_PATH if robust else GRASP_MODEL_PATH
+    best_model_path = (
+        BEST_ROBUST_GRASP_MODEL_PATH if robust else BEST_GRASP_MODEL_PATH)
+    metrics_path = (
+        ROBUST_GRASP_METRICS_PATH if robust else GRASP_METRICS_PATH)
+    evaluation_randomization = 1.0 if robust else 0.0
     print("=" * 72)
-    print("  Demo 2 / Grasp: IK接近 + DAgger + TD3+BC 接触抓取")
+    mode = "域随机化鲁棒抓取" if robust else "基线抓取"
+    print(f"  Demo 2 / Grasp: IK + DAgger + TD3+BC {mode}")
     print("  最终评估仅使用8维RL策略：7个手臂关节 + 夹爪开合")
     print("=" * 72, flush=True)
 
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    train_env = RobotGraspEnv(difficulty=config.curriculum[0])
-    data_env = RobotGraspEnv(difficulty=1.0)
+    train_env = RobotGraspEnv(
+        difficulty=config.curriculum[0],
+        randomization=config.randomization_curriculum[0],
+        observe_action_history=robust,
+    )
+    data_env = RobotGraspEnv(
+        difficulty=1.0,
+        randomization=evaluation_randomization,
+        observe_action_history=robust,
+    )
     model = build_grasp_td3(train_env, config.seed)
     history: list[dict] = []
     best_success_rate = -1.0
     best_checkpoint_score = (-1.0,) * 5
 
     try:
+        if robust and GRASP_MODEL_PATH.exists():
+            warm_start_grasp_model(model, GRASP_MODEL_PATH)
+            metrics = evaluate_grasp(
+                model,
+                episodes=config.eval_episodes,
+                seed=config.seed + 100_000,
+                randomization=evaluation_randomization,
+            )
+            print_grasp_evaluation("基线模型热启动", metrics)
+            history.append({"stage": "warm_start", **metrics})
+            best_success_rate = float(metrics["success_rate"])
+            best_checkpoint_score = grasp_checkpoint_score(metrics)
+            model.save(best_model_path)
+
         print(f"\n[1/3] 收集 {config.expert_steps} 条抓取示范...", flush=True)
         expert_data = collect_demonstrations(
             data_env,
@@ -812,17 +1106,26 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
         add_to_replay_buffer(model, expert_data)
         print(f"      行为克隆完成，loss={bc_loss:.6f}", flush=True)
         metrics = evaluate_grasp(
-            model, episodes=config.eval_episodes, seed=config.seed + 100_000)
+            model,
+            episodes=config.eval_episodes,
+            seed=config.seed + 100_000,
+            randomization=evaluation_randomization,
+        )
         print_grasp_evaluation("行为克隆", metrics)
         history.append({"stage": "behavior_cloning", **metrics})
-        best_success_rate = float(metrics["success_rate"])
-        best_checkpoint_score = grasp_checkpoint_score(metrics)
-        model.save(BEST_GRASP_MODEL_PATH)
+        checkpoint_score = grasp_checkpoint_score(metrics)
+        if checkpoint_score > best_checkpoint_score:
+            best_success_rate = float(metrics["success_rate"])
+            best_checkpoint_score = checkpoint_score
+            model.save(best_model_path)
 
         datasets = [expert_data]
         combined = expert_data
         print(f"\n[2/3] DAgger {config.dagger_iterations} 轮...", flush=True)
         for iteration in range(config.dagger_iterations):
+            model.set_parameters(
+                best_model_path, exact_match=True, device=model.device)
+            model.actor_target.load_state_dict(model.actor.state_dict())
             teacher_mix = max(0.6 - 0.2 * iteration, 0.1)
             dagger_data = collect_demonstrations(
                 data_env,
@@ -847,6 +1150,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 model,
                 episodes=config.eval_episodes,
                 seed=config.seed + 100_000,
+                randomization=evaluation_randomization,
             )
             print_grasp_evaluation(f"DAgger {iteration + 1}", metrics)
             print(
@@ -859,37 +1163,53 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             if checkpoint_score > best_checkpoint_score:
                 best_success_rate = float(metrics["success_rate"])
                 best_checkpoint_score = checkpoint_score
-                model.save(BEST_GRASP_MODEL_PATH)
+                model.save(best_model_path)
 
         model.set_parameters(
-            BEST_GRASP_MODEL_PATH, exact_match=True, device=model.device)
+            best_model_path, exact_match=True, device=model.device)
         model.actor_target.load_state_dict(model.actor.state_dict())
         print("\n[3/3] TD3+BC在线接触强化学习微调...", flush=True)
         model.set_expert_data(
             combined,
-            start=1.2,
-            end=0.30,
+            start=config.bc_start,
+            end=config.bc_end,
             decay_updates=sum(config.rl_phase_steps),
             balance_phases=True,
             action_weights=GRASP_BC_ACTION_WEIGHTS,
             q_filter=True,
+            hold_state_index=22,
+            hold_action_index=7,
+            hold_target=1.0,
+            hold_coefficient=config.hold_coefficient,
+            anchor_coefficient=config.anchor_coefficient,
+            actor_trainable_suffix_start=(
+                BASE_OBSERVATION_SIZE if robust else None),
         )
+        model.rl_weight = config.rl_weight
+        model.actor_learning_rate = config.actor_learning_rate
         print(
             f"      先用 {config.critic_warmup_steps} 次抓取回放预热critic...",
             flush=True,
         )
         warmup_critic(model, config.critic_warmup_steps)
         total_rl_steps = 0
-        for phase, (difficulty, phase_steps) in enumerate(
-            zip(config.curriculum, config.rl_phase_steps), start=1
+        for phase, (difficulty, randomization, phase_steps) in enumerate(
+            zip(
+                config.curriculum,
+                config.randomization_curriculum,
+                config.rl_phase_steps,
+            ),
+            start=1,
         ):
             train_env.set_difficulty(difficulty)
+            train_env.set_randomization(randomization)
             model.learn(
                 total_timesteps=phase_steps,
                 reset_num_timesteps=False,
                 progress_bar=False,
             )
             total_rl_steps += phase_steps
+            action_drift = model.reference_action_drift()
             metrics = evaluate_grasp(
                 model,
                 episodes=config.eval_episodes,
@@ -897,53 +1217,72 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 # Select checkpoints on the same full-workspace test set;
                 # curriculum difficulty affects data collection only.
                 difficulty=1.0,
+                randomization=evaluation_randomization,
             )
-            label = f"TD3+BC阶段{phase} difficulty={difficulty:.2f}"
+            label = (
+                f"TD3+BC阶段{phase} difficulty={difficulty:.2f} "
+                f"randomization={randomization:.2f}"
+            )
             print_grasp_evaluation(label, metrics)
+            print(
+                "      基线动作漂移："
+                f"mean={action_drift['mean']:.4f} | "
+                f"P95={action_drift['p95']:.4f} | "
+                f"max={action_drift['max']:.4f}",
+                flush=True,
+            )
             history.append({
                 "stage": f"td3_bc_{phase}",
                 "difficulty": difficulty,
+                "randomization": randomization,
                 "rl_steps": total_rl_steps,
+                "reference_action_drift": action_drift,
                 **metrics,
             })
             checkpoint_score = grasp_checkpoint_score(metrics)
-            if checkpoint_score > best_checkpoint_score:
+            checkpoint_improved = checkpoint_score > best_checkpoint_score
+            if checkpoint_improved:
                 best_success_rate = float(metrics["success_rate"])
                 best_checkpoint_score = checkpoint_score
-                model.save(BEST_GRASP_MODEL_PATH)
-            elif metrics["success_rate"] + 0.10 < best_success_rate:
+                model.save(best_model_path)
+            else:
                 model.set_parameters(
-                    BEST_GRASP_MODEL_PATH, exact_match=True, device=model.device)
+                    best_model_path, exact_match=True, device=model.device)
                 model.rl_weight *= 0.5
-                print("      策略退化，已恢复最佳权重并降低RL更新权重。", flush=True)
+                print(
+                    "      未超过最佳检查点，已恢复最佳权重并降低RL更新权重。",
+                    flush=True,
+                )
             if (
                 total_rl_steps >= 10_000
+                and checkpoint_improved
                 and metrics["success_rate"] >= config.target_success_rate
             ):
                 print("      已达到抓取成功率目标，提前停止课程训练。", flush=True)
                 break
 
         model.set_parameters(
-            BEST_GRASP_MODEL_PATH, exact_match=True, device=model.device)
-        model.save(GRASP_MODEL_PATH)
+            best_model_path, exact_match=True, device=model.device)
+        model.save(model_path)
         final_metrics = evaluate_grasp(
             model,
             episodes=config.final_eval_episodes,
             seed=config.seed + 200_000,
             difficulty=1.0,
+            randomization=evaluation_randomization,
         )
         print_grasp_evaluation("最终RL独立测试集", final_metrics)
         result = {
             "config": asdict(config),
             "history": history,
             "final": final_metrics,
-            "model_path": str(GRASP_MODEL_PATH),
-            "best_model_path": str(BEST_GRASP_MODEL_PATH),
+            "model_path": str(model_path),
+            "best_model_path": str(best_model_path),
         }
-        GRASP_METRICS_PATH.write_text(
+        metrics_path.write_text(
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\n抓取模型已保存到 {GRASP_MODEL_PATH}")
-        print(f"训练指标已保存到 {GRASP_METRICS_PATH}")
+        print(f"\n抓取模型已保存到 {model_path}")
+        print(f"训练指标已保存到 {metrics_path}")
         return result
     finally:
         data_env.close()
