@@ -29,7 +29,7 @@ Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── 
 | 模型 | 参数量 | 输入 | 输出 | 定位 |
 |------|--------|------|------|------|
 | **MLP 策略网络 / reach** | 19K | 关节角度+位置(13维) | 手臂关节增量(7维) | 到达基准 |
-| **MLP 策略网络 / grasp** | 约75K | 关节+夹爪+方块+接触(22维) | 手臂7维+夹爪1维 | 接触抓取 |
+| **MLP 策略网络 / grasp** | 约74K | 关节+夹爪+方块+接触+抓取状态(24维) | 手臂7维+夹爪1维 | 接触抓取 |
 | **EEGNet / CNN** | 100K-1M | RGB 图像 | 动作 | 视觉感知 |
 | **RT-2** (Google) | 55B | 图像+语言 | 动作token | VLA 先驱 |
 | **OpenVLA** (Stanford) | 7B | 图像+语言 | 动作 | 开源 VLA |
@@ -75,7 +75,7 @@ Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── 
 | **Gymnasium 环境** | Demo 2 | 标准的 obs/action/reward/done 接口 |
 | **策略网络** | Demo 2 | 神经网络：观测 → 动作 |
 | **奖励设计** | Demo 2 | 靠近 < 双侧接触 < 抬升 < 稳定保持 |
-| **IK 引导训练** | Demo 2 | 行为克隆 + DAgger 加速冷启动 |
-| **TD3+BC** | Demo 2 | 经验回放 + IK 行为约束的连续动作强化学习 |
+| **IK 引导训练** | Demo 2 | 阶段平衡行为克隆 + DAgger 加速冷启动 |
+| **TD3+BC** | Demo 2 | 经验回放 + Q-filter IK 约束的连续动作强化学习 |
 | **模型部署** | Demo 3 | 加载 Stable-Baselines3 模型运行 |
 | **Sim-to-Real** | Demo 3 | 仿真训练 → 真机运行，模型不变 |

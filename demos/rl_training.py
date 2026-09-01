@@ -78,6 +78,7 @@ class Demonstrations:
     next_observations: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
+    phases: np.ndarray
 
     def __len__(self) -> int:
         return len(self.observations)
@@ -298,6 +299,9 @@ class GuidedTD3(TD3):
         super().__init__(*args, **kwargs)
         self._expert_observations: torch.Tensor | None = None
         self._expert_actions: torch.Tensor | None = None
+        self._expert_phase_indices: list[torch.Tensor] = []
+        self._bc_action_weights: torch.Tensor | None = None
+        self._q_filter = False
         self._bc_start = 1.0
         self._bc_end = 0.25
         self._bc_decay_updates = 50_000
@@ -310,11 +314,29 @@ class GuidedTD3(TD3):
         start: float = 1.0,
         end: float = 0.25,
         decay_updates: int = 50_000,
+        balance_phases: bool = False,
+        action_weights: np.ndarray | None = None,
+        q_filter: bool = False,
     ) -> None:
         self._expert_observations = torch.as_tensor(
             demonstrations.observations, device=self.device)
         self._expert_actions = torch.as_tensor(
             demonstrations.teacher_actions, device=self.device)
+        self._expert_phase_indices = []
+        if balance_phases:
+            for phase in np.unique(demonstrations.phases):
+                indices = np.flatnonzero(demonstrations.phases == phase)
+                self._expert_phase_indices.append(torch.as_tensor(
+                    indices, dtype=torch.long, device=self.device))
+        if action_weights is None:
+            action_weights = np.ones(
+                demonstrations.teacher_actions.shape[1], dtype=np.float32)
+        weights = np.asarray(action_weights, dtype=np.float32)
+        if weights.shape != (demonstrations.teacher_actions.shape[1],):
+            raise ValueError("action_weights must match the action dimension")
+        self._bc_action_weights = torch.as_tensor(
+            weights / max(float(weights.mean()), 1e-6), device=self.device)
+        self._q_filter = bool(q_filter)
         self._bc_start = start
         self._bc_end = end
         self._bc_decay_updates = max(decay_updates, 1)
@@ -328,6 +350,7 @@ class GuidedTD3(TD3):
         actor_losses = []
         critic_losses = []
         bc_losses = []
+        q_filter_fractions = []
 
         for _ in range(gradient_steps):
             self._n_updates += 1
@@ -373,15 +396,55 @@ class GuidedTD3(TD3):
                 q_scale = q_values.abs().mean().detach().clamp_min(1e-3)
                 rl_loss = -self.rl_weight * q_values.mean() / q_scale
 
-                expert_indices = torch.randint(
-                    len(self._expert_observations),
-                    (batch_size,),
-                    device=self.device,
-                )
+                if self._expert_phase_indices:
+                    samples_per_phase = int(np.ceil(
+                        batch_size / len(self._expert_phase_indices)))
+                    sampled_groups = []
+                    for phase_indices in self._expert_phase_indices:
+                        offsets = torch.randint(
+                            len(phase_indices),
+                            (samples_per_phase,),
+                            device=self.device,
+                        )
+                        sampled_groups.append(phase_indices[offsets])
+                    expert_indices = torch.cat(sampled_groups)[:batch_size]
+                    expert_indices = expert_indices[
+                        torch.randperm(batch_size, device=self.device)]
+                else:
+                    expert_indices = torch.randint(
+                        len(self._expert_observations),
+                        (batch_size,),
+                        device=self.device,
+                    )
+                expert_observations = self._expert_observations[expert_indices]
+                expert_actions = self._expert_actions[expert_indices]
                 expert_predictions = self.actor(
-                    self._expert_observations[expert_indices])
-                bc_loss = F.mse_loss(
-                    expert_predictions, self._expert_actions[expert_indices])
+                    expert_observations)
+                element_losses = F.smooth_l1_loss(
+                    expert_predictions, expert_actions, reduction="none")
+                if self._bc_action_weights is not None:
+                    element_losses = element_losses * self._bc_action_weights
+                sample_losses = element_losses.mean(dim=1)
+                if self._q_filter:
+                    with torch.no_grad():
+                        teacher_q = torch.cat(
+                            self.critic(expert_observations, expert_actions),
+                            dim=1,
+                        ).min(dim=1).values
+                        policy_q = torch.cat(
+                            self.critic(
+                                expert_observations,
+                                expert_predictions.detach(),
+                            ),
+                            dim=1,
+                        ).min(dim=1).values
+                        q_mask = (teacher_q >= policy_q).float()
+                    bc_loss = (
+                        sample_losses * q_mask
+                    ).sum() / q_mask.sum().clamp_min(1.0)
+                    q_filter_fractions.append(q_mask.mean().item())
+                else:
+                    bc_loss = sample_losses.mean()
                 progress = min(self._n_updates / self._bc_decay_updates, 1.0)
                 bc_coefficient = (
                     self._bc_start
@@ -417,10 +480,19 @@ class GuidedTD3(TD3):
             self.logger.record("train/actor_loss", float(np.mean(actor_losses)))
             self.logger.record("train/ik_bc_loss", float(np.mean(bc_losses)))
             self.logger.record("train/rl_weight", self.rl_weight)
+            if q_filter_fractions:
+                self.logger.record(
+                    "train/q_filter_fraction",
+                    float(np.mean(q_filter_fractions)),
+                )
 
     def _excluded_save_params(self) -> list[str]:
         return super()._excluded_save_params() + [
-            "_expert_observations", "_expert_actions"]
+            "_expert_observations",
+            "_expert_actions",
+            "_expert_phase_indices",
+            "_bc_action_weights",
+        ]
 
 
 def collect_demonstrations(
@@ -441,10 +513,13 @@ def collect_demonstrations(
     next_observations: list[np.ndarray] = []
     rewards: list[float] = []
     dones: list[bool] = []
+    phases: list[int] = []
 
     episode = 0
     observation, _ = env.reset(seed=seed)
     while len(observations) < steps:
+        get_phase = getattr(env, "get_demonstration_phase", None)
+        phase = int(get_phase()) if get_phase is not None else 0
         teacher_action = env.get_ik_action()
         if model is None:
             policy_action = teacher_action
@@ -469,6 +544,7 @@ def collect_demonstrations(
         next_observations.append(next_observation)
         rewards.append(reward)
         dones.append(done)
+        phases.append(phase)
 
         observation = next_observation
         if done:
@@ -482,6 +558,7 @@ def collect_demonstrations(
         next_observations=np.asarray(next_observations, dtype=np.float32),
         rewards=np.asarray(rewards, dtype=np.float32),
         dones=np.asarray(dones, dtype=np.float32),
+        phases=np.asarray(phases, dtype=np.int64),
     )
 
 
@@ -492,27 +569,59 @@ def pretrain_actor(
     epochs: int,
     batch_size: int = 256,
     seed: int,
+    balance_phases: bool = False,
+    action_weights: np.ndarray | None = None,
 ) -> float:
     """Behaviour-clone the deterministic TD3 actor from IK labels."""
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
+    rng = np.random.default_rng(seed)
     observations = torch.as_tensor(
         demonstrations.observations, device=model.device)
     teacher_actions = torch.as_tensor(
         demonstrations.teacher_actions, device=model.device)
+    if action_weights is None:
+        action_weights = np.ones(teacher_actions.shape[1], dtype=np.float32)
+    weights_array = np.asarray(action_weights, dtype=np.float32)
+    if weights_array.shape != (teacher_actions.shape[1],):
+        raise ValueError("action_weights must match the action dimension")
+    action_weight_tensor = torch.as_tensor(
+        weights_array / max(float(weights_array.mean()), 1e-6),
+        device=model.device,
+    )
+    phase_groups = [
+        np.flatnonzero(demonstrations.phases == phase)
+        for phase in np.unique(demonstrations.phases)
+    ]
     final_loss = 0.0
 
     model.actor.train(True)
     for _ in range(epochs):
-        permutation = torch.randperm(
-            len(demonstrations), generator=generator)
+        if balance_phases and len(phase_groups) > 1:
+            samples_per_phase = int(np.ceil(
+                len(demonstrations) / len(phase_groups)))
+            sampled = np.concatenate([
+                rng.choice(group, samples_per_phase, replace=True)
+                for group in phase_groups
+            ])[:len(demonstrations)]
+            permutation = torch.as_tensor(
+                sampled[rng.permutation(len(sampled))],
+                dtype=torch.long,
+            )
+        else:
+            permutation = torch.randperm(
+                len(demonstrations), generator=generator)
         total_loss = 0.0
         batches = 0
         for start in range(0, len(demonstrations), batch_size):
             indices = permutation[start:start + batch_size].to(model.device)
             predicted = model.actor(observations[indices])
-            loss = F.smooth_l1_loss(predicted, teacher_actions[indices])
+            loss = (
+                F.smooth_l1_loss(
+                    predicted, teacher_actions[indices], reduction="none")
+                * action_weight_tensor
+            ).mean()
             model.actor.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 1.0)

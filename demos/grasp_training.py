@@ -39,11 +39,14 @@ CUBE_HALF_EXTENT = 0.025
 CUBE_REST_Z = TABLE_TOP_Z + CUBE_HALF_EXTENT
 GRASP_SUCCESS_HEIGHT = 0.035
 GRASP_HOLD_STEPS = 8
-GRASP_DISTANCE = 0.045
+GRASP_DISTANCE = 0.030
+SAFE_CLOSE_DISTANCE = 0.035
+FINE_ALIGNMENT_DISTANCE = 0.075
 GRIPPER_OPEN_ANGLE = 0.30
 GRIPPER_CLOSED_ANGLE = -0.02
 GRASP_CENTER_Z_OFFSET = 0.005
 TEACHER_LIFT_HEIGHT = 0.08
+GRASP_BC_ACTION_WEIGHTS = np.array([1.0] * 7 + [4.0], dtype=np.float32)
 
 GRASP_MODEL_PATH = Path("grasp_policy.zip")
 BEST_GRASP_MODEL_PATH = Path("best_grasp_policy.zip")
@@ -62,9 +65,10 @@ class GraspTrainingConfig:
     dagger_epochs: int = 8
     critic_warmup_steps: int = 3_000
     rl_phase_steps: tuple[int, ...] = (15_000, 25_000, 40_000)
-    curriculum: tuple[float, ...] = (0.35, 0.70, 1.00)
+    curriculum: tuple[float, ...] = (1.00, 1.00, 1.00)
     eval_episodes: int = 50
-    target_success_rate: float = 0.80
+    final_eval_episodes: int = 100
+    target_success_rate: float = 0.95
 
     @classmethod
     def quick(cls, seed: int = 20260901) -> "GraspTrainingConfig":
@@ -81,6 +85,7 @@ class GraspTrainingConfig:
             rl_phase_steps=(750,),
             curriculum=(0.35,),
             eval_episodes=10,
+            final_eval_episodes=20,
             target_success_rate=1.0,
         )
 
@@ -124,7 +129,7 @@ class RobotGraspEnv(gym.Env):
         self.max_steps = int(max_steps)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(8,), dtype=np.float32)
         self.observation_space = spaces.Box(
-            -5.0, 5.0, shape=(22,), dtype=np.float32)
+            -5.0, 5.0, shape=(24,), dtype=np.float32)
 
         mode = p.GUI if render_mode == "human" else p.DIRECT
         self.client = p.connect(mode)
@@ -278,8 +283,10 @@ class RobotGraspEnv(gym.Env):
             raise ValueError(f"expected action shape (8,), got {action.shape}")
         action = np.clip(action, -1.0, 1.0)
 
+        released_cube = False
         if self.is_grasped and action[7] < -0.5:
             self._release_cube()
+            released_cube = True
 
         joint_positions = self._get_joint_positions()
         joint_targets = joint_positions + action[:7] * ARM_ACTION_SCALE
@@ -327,20 +334,31 @@ class RobotGraspEnv(gym.Env):
             - 0.001 * smoothness_cost
         )
         reward += 0.08 * (int(left_contact) + int(right_contact))
+        premature_close = (
+            max(float(action[7]), 0.0)
+            * max(distance - SAFE_CLOSE_DISTANCE, 0.0)
+            / 0.05
+        )
+        reward -= 0.25 * premature_close
         if left_contact and right_contact:
             reward += 0.35
         if newly_grasped:
             reward += 4.0
         if self.is_grasped:
             reward += 0.20
+            reward += 0.60 * min(
+                lift_height / GRASP_SUCCESS_HEIGHT, 1.0)
         reward += 45.0 * max(lift_progress, -0.005)
         if lift_height >= 0.02:
             reward += 1.0
 
         stable_lift = self.is_grasped and lift_height >= GRASP_SUCCESS_HEIGHT
         self.hold_steps = self.hold_steps + 1 if stable_lift else 0
-        terminated = self.hold_steps >= GRASP_HOLD_STEPS
-        if terminated:
+        grasp_succeeded = self.hold_steps >= GRASP_HOLD_STEPS
+        if released_cube:
+            reward -= 8.0
+        terminated = grasp_succeeded or released_cube
+        if grasp_succeeded:
             reward += 25.0
         truncated = self.step_count >= self.max_steps
 
@@ -405,6 +423,15 @@ class RobotGraspEnv(gym.Env):
             arm_action,
             np.array([gripper_action], dtype=np.float64),
         ]).astype(np.float32)
+
+    def get_demonstration_phase(self) -> int:
+        """Return approach/alignment/lift phase for balanced imitation batches."""
+
+        if self.is_grasped:
+            return 2
+        if self._distance_to_cube() < FINE_ALIGNMENT_DISTANCE:
+            return 1
+        return 0
 
     def _prepare_ik_limits(self) -> None:
         self._ik_joints = []
@@ -595,6 +622,10 @@ class RobotGraspEnv(gym.Env):
         cube_velocity = np.asarray(p.getBaseVelocity(
             self.cube_id, physicsClientId=self.client)[0]) / 2.0
         contacts = np.asarray(self._finger_contacts(), dtype=np.float64)
+        grasp_state = np.array([float(self.is_grasped)])
+        lift_height = max(
+            0.0, float(self._get_cube_pos()[2] - self.cube_start_pos[2]))
+        lift_progress = np.array([lift_height / TEACHER_LIFT_HEIGHT])
         observation = np.concatenate([
             joints,
             opening,
@@ -603,6 +634,8 @@ class RobotGraspEnv(gym.Env):
             cube_error,
             cube_velocity,
             contacts,
+            grasp_state,
+            lift_progress,
         ])
         return np.clip(observation, -5.0, 5.0).astype(np.float32)
 
@@ -610,7 +643,7 @@ class RobotGraspEnv(gym.Env):
         left_contact, right_contact = self._finger_contacts()
         lift_height = max(
             0.0, float(self._get_cube_pos()[2] - self.cube_start_pos[2]))
-        success = self.is_grasped and lift_height >= GRASP_SUCCESS_HEIGHT
+        success = self.hold_steps >= GRASP_HOLD_STEPS
         return {
             "distance": float(distance),
             "lift_height": lift_height,
@@ -668,24 +701,38 @@ def evaluate_grasp(
     env = RobotGraspEnv(difficulty=difficulty)
     successes = 0
     grasps = 0
+    bilateral_contacts = 0
+    approaches = 0
     lift_heights: list[float] = []
+    minimum_distances: list[float] = []
     episode_steps: list[int] = []
     try:
         for episode in range(episodes):
             observation, _ = env.reset(seed=seed + episode)
             best_lift = 0.0
+            minimum_distance = float("inf")
             ever_grasped = False
+            ever_bilateral_contact = False
             info: dict[str, float | bool] = {}
             for step in range(env.max_steps):
                 action, _ = model.predict(observation, deterministic=True)
                 observation, _, terminated, truncated, info = env.step(action)
                 best_lift = max(best_lift, float(info["lift_height"]))
+                minimum_distance = min(
+                    minimum_distance, float(info["distance"]))
                 ever_grasped = ever_grasped or bool(info["grasped"])
+                ever_bilateral_contact = (
+                    ever_bilateral_contact
+                    or bool(info["left_contact"] and info["right_contact"])
+                )
                 if terminated or truncated:
                     break
             successes += bool(info.get("is_success", False))
             grasps += ever_grasped
+            bilateral_contacts += ever_bilateral_contact
+            approaches += minimum_distance < FINE_ALIGNMENT_DISTANCE
             lift_heights.append(best_lift)
+            minimum_distances.append(minimum_distance)
             episode_steps.append(step + 1)
     finally:
         env.close()
@@ -695,6 +742,9 @@ def evaluate_grasp(
         "successes": int(successes),
         "success_rate": successes / episodes,
         "grasp_rate": grasps / episodes,
+        "bilateral_contact_rate": bilateral_contacts / episodes,
+        "approach_rate": approaches / episodes,
+        "mean_min_distance_m": float(np.mean(minimum_distances)),
         "mean_lift_height_m": float(np.mean(lift_heights)),
         "p95_lift_height_m": float(np.percentile(lift_heights, 95)),
         "mean_steps": float(np.mean(episode_steps)),
@@ -705,10 +755,26 @@ def print_grasp_evaluation(label: str, metrics: dict[str, float | int]) -> None:
     print(
         f"[{label}] 抓取成功率={metrics['success_rate']:.1%} "
         f"({metrics['successes']}/{metrics['episodes']}) | "
+        f"接近率={metrics['approach_rate']:.1%} | "
+        f"双指接触率={metrics['bilateral_contact_rate']:.1%} | "
         f"夹住率={metrics['grasp_rate']:.1%} | "
         f"平均抬高={metrics['mean_lift_height_m'] * 100:.1f}cm | "
         f"平均步数={metrics['mean_steps']:.1f}",
         flush=True,
+    )
+
+
+def grasp_checkpoint_score(
+    metrics: dict[str, float | int],
+) -> tuple[float, float, float, float, float]:
+    """Rank partial progress when multiple policies have equal success rates."""
+
+    return (
+        float(metrics["success_rate"]),
+        float(metrics["grasp_rate"]),
+        float(metrics["bilateral_contact_rate"]),
+        float(metrics["mean_lift_height_m"]),
+        float(metrics["approach_rate"]),
     )
 
 
@@ -725,6 +791,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
     model = build_grasp_td3(train_env, config.seed)
     history: list[dict] = []
     best_success_rate = -1.0
+    best_checkpoint_score = (-1.0,) * 5
 
     try:
         print(f"\n[1/3] 收集 {config.expert_steps} 条抓取示范...", flush=True)
@@ -739,6 +806,8 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             expert_data,
             epochs=config.bc_epochs,
             seed=config.seed,
+            balance_phases=True,
+            action_weights=GRASP_BC_ACTION_WEIGHTS,
         )
         add_to_replay_buffer(model, expert_data)
         print(f"      行为克隆完成，loss={bc_loss:.6f}", flush=True)
@@ -747,6 +816,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
         print_grasp_evaluation("行为克隆", metrics)
         history.append({"stage": "behavior_cloning", **metrics})
         best_success_rate = float(metrics["success_rate"])
+        best_checkpoint_score = grasp_checkpoint_score(metrics)
         model.save(BEST_GRASP_MODEL_PATH)
 
         datasets = [expert_data]
@@ -769,6 +839,8 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 combined,
                 epochs=config.dagger_epochs,
                 seed=config.seed + iteration + 1,
+                balance_phases=True,
+                action_weights=GRASP_BC_ACTION_WEIGHTS,
             )
             add_to_replay_buffer(model, dagger_data)
             metrics = evaluate_grasp(
@@ -783,10 +855,14 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 flush=True,
             )
             history.append({"stage": f"dagger_{iteration + 1}", **metrics})
-            if metrics["success_rate"] > best_success_rate:
+            checkpoint_score = grasp_checkpoint_score(metrics)
+            if checkpoint_score > best_checkpoint_score:
                 best_success_rate = float(metrics["success_rate"])
+                best_checkpoint_score = checkpoint_score
                 model.save(BEST_GRASP_MODEL_PATH)
 
+        model.set_parameters(
+            BEST_GRASP_MODEL_PATH, exact_match=True, device=model.device)
         model.actor_target.load_state_dict(model.actor.state_dict())
         print("\n[3/3] TD3+BC在线接触强化学习微调...", flush=True)
         model.set_expert_data(
@@ -794,6 +870,9 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             start=1.2,
             end=0.30,
             decay_updates=sum(config.rl_phase_steps),
+            balance_phases=True,
+            action_weights=GRASP_BC_ACTION_WEIGHTS,
+            q_filter=True,
         )
         print(
             f"      先用 {config.critic_warmup_steps} 次抓取回放预热critic...",
@@ -827,8 +906,10 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 "rl_steps": total_rl_steps,
                 **metrics,
             })
-            if metrics["success_rate"] > best_success_rate:
+            checkpoint_score = grasp_checkpoint_score(metrics)
+            if checkpoint_score > best_checkpoint_score:
                 best_success_rate = float(metrics["success_rate"])
+                best_checkpoint_score = checkpoint_score
                 model.save(BEST_GRASP_MODEL_PATH)
             elif metrics["success_rate"] + 0.10 < best_success_rate:
                 model.set_parameters(
@@ -847,7 +928,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
         model.save(GRASP_MODEL_PATH)
         final_metrics = evaluate_grasp(
             model,
-            episodes=config.eval_episodes,
+            episodes=config.final_eval_episodes,
             seed=config.seed + 200_000,
             difficulty=1.0,
         )
