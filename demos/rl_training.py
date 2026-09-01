@@ -424,7 +424,7 @@ class GuidedTD3(TD3):
 
 
 def collect_demonstrations(
-    env: RobotArmEnv,
+    env: gym.Env,
     steps: int,
     *,
     seed: int,
@@ -432,7 +432,7 @@ def collect_demonstrations(
     teacher_mix: float = 1.0,
     noise_scale: float = 0.03,
 ) -> Demonstrations:
-    """Collect IK labels, optionally on states visited by a learned policy."""
+    """Collect teacher labels, optionally on states visited by a learned policy."""
 
     rng = np.random.default_rng(seed)
     observations: list[np.ndarray] = []
@@ -455,7 +455,11 @@ def collect_demonstrations(
             + (1.0 - teacher_mix) * np.asarray(policy_action)
         )
         action = np.clip(
-            action + rng.normal(0.0, noise_scale, size=7), -1.0, 1.0)
+            action + rng.normal(
+                0.0, noise_scale, size=env.action_space.shape),
+            -1.0,
+            1.0,
+        )
         next_observation, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
@@ -796,7 +800,13 @@ def train(config: TrainingConfig) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train the Kuka reaching policy with IK-guided TD3+BC.")
+        description="Train Kuka reaching or grasping with IK-guided TD3+BC.")
+    parser.add_argument(
+        "--task",
+        choices=("reach", "grasp"),
+        default="reach",
+        help="keep the 7-DoF reaching baseline or train the 8-DoF grasp task",
+    )
     parser.add_argument(
         "--quick", action="store_true",
         help="run a small smoke test instead of convergence training")
@@ -809,6 +819,28 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.task == "grasp":
+        from grasp_training import (  # Imported lazily to avoid a cycle.
+            GraspTrainingConfig,
+            RobotGraspEnv,
+            train_grasp,
+        )
+
+        if args.check_env:
+            env = RobotGraspEnv()
+            try:
+                check_env(env, warn=True)
+                print("Grasping Gymnasium environment check passed.")
+            finally:
+                env.close()
+            return
+        config = (
+            GraspTrainingConfig.quick(args.seed)
+            if args.quick
+            else GraspTrainingConfig(seed=args.seed)
+        )
+        train_grasp(config)
+        return
     if args.check_env:
         env = RobotArmEnv()
         try:

@@ -37,9 +37,10 @@ git clone https://github.com/unitreerobotics/unitree_mujoco.git ../unitree_mujoc
 
 ## Demo 展示
 
-### Demo 1: 机械臂抓取
+### Demo 1: 机械臂到达（IK 基准）
 
-用**逆运动学**控制 Kuka 7-DOF 机械臂分三步抓取红色方块。
+用**逆运动学**控制 Kuka 7-DOF 机械臂分三步接近红色方块。这个 Demo
+只验证末端到达，不包含可开合夹爪，作为后续 RL 抓取的 IK 基准。
 
 | 初始状态 | 接近目标 | 到达抓取位置 |
 |:---:|:---:|:---:|
@@ -54,21 +55,31 @@ python demos/01_robot_arm_grasp.py
 
 先用逆运动学（IK）生成示范，通过行为克隆和 DAgger 完成冷启动，再用
 TD3+BC 强化学习微调。IK 只在训练阶段担任老师，最终评估和部署仅使用 RL
-策略。训练完成后输出 `trained_policy.zip` 模型和
-`training_metrics.json` 指标。
+策略。现在提供两个任务：`reach` 保留已经达到 97% 独立成功率的 7 维到达
+基线；`grasp` 使用带 WSG50 夹爪的 Kuka、动态碰撞方块和 8 维动作完成
+“接近 → 合拢 → 抬起 → 稳定保持”。
 
 ```python
-obs = env.get_observation()          # 感知（13维向量）
+# reach: 13维观测 → 7个手臂关节
+# grasp: 22维观测 → 7个手臂关节 + 1个夹爪开合
 action = policy_network(obs)         # 决策（AI 推理）
-env.step(action)                     # 执行（7个关节）
+env.step(action)                     # 执行并计算接触/抬升奖励
 ```
 
 ```bash
-python demos/02_rl_training.py
+python demos/02_rl_training.py --task reach
+
+# 真正抓取：输出 grasp_policy.zip 和 grasp_training_metrics.json
+python demos/02_rl_training.py --task grasp
 
 # 快速验证完整流水线（不用于判断最终收敛）
-python demos/02_rl_training.py --quick
+python demos/02_rl_training.py --task grasp --quick
 ```
+
+抓取奖励按任务阶段递增：靠近方块获得小奖励，左右手指同时接触获得中等奖励，
+方块离开台面获得大奖励，持续抬高 3.5 cm 才判定成功。为避免轻量级
+PyBullet 夹爪在接触后数值打滑，环境只在检测到双侧真实碰撞后建立有限力的
+抓取约束；张开夹爪会立即释放方块。
 
 ### Demo 3: 模型部署
 
@@ -82,7 +93,8 @@ env.step(action)                         ros_node.send_cmd(action)
 ```
 
 ```bash
-python demos/03_deploy_model.py
+python demos/03_deploy_model.py --task reach
+python demos/03_deploy_model.py --task grasp
 ```
 
 ### Demo 4: 宇树 G1 人形机器人动作
@@ -201,14 +213,15 @@ ChannelFactory.Instance().Init(0, "eth0")    # 以太网
 ```
 embodied-agent/
 ├── demos/
-│   ├── 01_robot_arm_grasp.py       # 逆运动学抓取 (PyBullet)
+│   ├── 01_robot_arm_grasp.py       # 逆运动学到达基准 (PyBullet)
 │   ├── 02_rl_training.py           # IK 引导的 TD3+BC 训练入口
 │   ├── 03_deploy_model.py          # 模型部署对比
 │   ├── 04_g1_actions.py            # 宇树 G1 动作演示 (MuJoCo)
 │   ├── 05_unitree_viewer.py        # 官方 Unitree 模型通用查看器
 │   ├── unitree_paths.py            # 外部 unitree_mujoco 路径解析
-│   └── rl_training.py              # Gymnasium 环境与训练流水线
-├── tests/                           # 无 GUI 路径解析单测
+│   ├── rl_training.py              # 7维到达环境与训练流水线
+│   └── grasp_training.py           # 8维接触抓取环境与训练流水线
+├── tests/                           # 无 GUI 环境与路径解析单测
 ├── docs/
 │   ├── tech_stack.md               # 技术栈全景
 │   └── unitree_dev_guide.md        # 宇树开发指南

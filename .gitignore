@@ -6,6 +6,9 @@ __pycache__/
 /best_policy.zip
 /trained_policy.zip
 /training_metrics.json
+/best_grasp_policy.zip
+/grasp_policy.zip
+/grasp_training_metrics.json
 .DS_Store
 *.egg-info/
 dist/

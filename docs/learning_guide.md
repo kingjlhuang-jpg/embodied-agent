@@ -427,16 +427,19 @@ RL 问题被形式化为 MDP，由五个元素组成：
 (S, A, P, R, γ)
 
 S — 状态空间: 机器人所有可能的状态
-    Demo 2 中: [7个关节角度, 3个末端坐标, 3个目标坐标] = 13维向量
+    reach: [7个关节角度, 末端坐标, 目标误差] = 13维
+    grasp: [关节, 夹爪开度, 指尖中心, 方块位置/速度, 接触] = 22维
 
 A — 动作空间: 机器人所有可能的动作
-    Demo 2 中: [7个关节角速度增量] = 7维向量
+    reach: [7个关节增量] = 7维
+    grasp: [7个关节增量, 夹爪开合] = 8维
 
 P — 转移概率: 执行动作后，环境变成什么状态
     由物理引擎决定（重力、碰撞等）
 
 R — 奖励函数: 评价每一步的好坏
-    Demo 2 中: -distance（离目标越近越好）
+    reach: 离目标越近越好
+    grasp: 靠近 < 双侧接触 < 抬高 < 稳定保持
 
 γ — 折扣因子: 未来奖励的衰减系数 (0~1)
     Demo 2 中: 0.99（重视长远回报）
@@ -450,8 +453,8 @@ R — 奖励函数: 评价每一步的好坏
 π(s) → a    "看到状态 s，做动作 a"
 
 在 Demo 2 中，策略就是一个神经网络:
-  输入: 13维观测向量 [关节角度, 末端位置, 目标位置]
-  输出: 7维动作向量 [每个关节的角速度增量]
+  reach 输入13维、输出7维
+  grasp 输入22维、输出8维（最后一维控制夹爪开合）
 ```
 
 ### 回报 (Return)
@@ -478,7 +481,8 @@ r_t     = 当前奖励
   <img src="../assets/neural_network.png" width="500" alt="Neural Network"/>
 </p>
 
-Demo 2 的策略网络结构：
+Demo 2 的策略网络结构（下面是 reach；grasp 把输入/输出改为 22/8，
+隐藏层扩大为 256）：
 
 ```python
 class PolicyNetwork(nn.Module):
@@ -536,6 +540,19 @@ if distance < 0.02:
     reward += 10.0
 ```
 
+抓取任务不能只奖励“离方块近”，否则策略会学会停在方块旁边。它使用阶段式奖励：
+
+```python
+reward += approach_progress          # 小：靠近方块
+reward += bilateral_contact_bonus    # 中：左右手指都接触
+reward += lift_progress              # 大：方块离开台面
+if lift_height >= 0.035 and stable:
+    reward += success_bonus           # 成功：持续稳定保持
+```
+
+方块具有质量、惯性和碰撞体。轻量级仿真会在双指接触后产生数值滑移，因此环境
+只在左右手指都检测到真实碰撞时建立有限力抓取约束；夹爪重新张开即解除约束。
+
 **奖励设计的技巧**：
 
 ```
@@ -587,6 +604,10 @@ IK 教师动作由当前关节角和 IK 解之间的差得到：
 q_ik = calculateInverseKinematics(robot, ee_link, target)
 teacher_action = clip((q_ik - current_q) / action_scale, -1, 1)
 ```
+
+在 `grasp` 任务中，老师采用闭环阶段策略：张开夹爪并让双指中心对准方块，
+进入 4.5 cm 范围后合拢，双侧接触成立后再生成向上的 IK 位移。RL 仍然学习
+完整 8 维动作，最终评估不会调用这个阶段策略。
 
 TD3 是面向连续动作的 off-policy 算法。它会把经历保存到 replay buffer，
 因此同一条仿真经验可以用于多次网络更新，样本利用率高于每条轨迹只使用

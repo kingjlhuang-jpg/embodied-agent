@@ -11,20 +11,21 @@
 只是把 RobotArmEnv 替换为真实硬件的 ROS 2 接口。
 """
 
+import argparse
 import os
 import sys
 import time
-from pathlib import Path
 
 from stable_baselines3 import TD3
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 复用训练时的环境定义
-from rl_training import RobotArmEnv
+from grasp_training import GRASP_MODEL_PATH, RobotGraspEnv
+from rl_training import MODEL_PATH, RobotArmEnv
 
 
-def deploy_in_simulation():
+def deploy_in_simulation(task="reach"):
     """在仿真中部署AI模型"""
     print("=" * 60)
     print("  部署AI模型到仿真机器人")
@@ -32,7 +33,7 @@ def deploy_in_simulation():
     print()
 
     # 1. 加载训练好的 TD3+BC 模型
-    model_path = Path("trained_policy.zip")
+    model_path = GRASP_MODEL_PATH if task == "grasp" else MODEL_PATH
     try:
         policy = TD3.load(model_path, device="auto")
         print(f"[OK] 已加载模型: {model_path}")
@@ -43,11 +44,18 @@ def deploy_in_simulation():
 
     # 2. 创建仿真环境（带3D可视化）
     print("[OK] 创建仿真环境（带可视化窗口）...")
-    env = RobotArmEnv(render=True)
+    env = (
+        RobotGraspEnv(render=True)
+        if task == "grasp"
+        else RobotArmEnv(render=True)
+    )
 
     print()
     print("开始运行！你可以用鼠标旋转视角。")
-    print("AI将尝试控制机械臂到达绿色目标球。")
+    if task == "grasp":
+        print("AI将尝试接近红色方块、合拢夹爪并将它稳定抬起。")
+    else:
+        print("AI将尝试控制机械臂到达绿色目标球。")
     print("按 Ctrl+C 退出。")
     print()
 
@@ -58,10 +66,12 @@ def deploy_in_simulation():
             obs, _ = env.reset()
             total_reward = 0
 
+            target_position = (
+                env.cube_start_pos if task == "grasp" else env.target_pos)
             print(f"--- 第 {episode} 轮 (目标位置: "
-                  f"{env.target_pos.round(3)}) ---")
+                  f"{target_position.round(3)}) ---")
 
-            for step in range(200):
+            for step in range(env.max_steps):
                 # AI推理：观测 → 动作
                 action, _ = policy.predict(obs, deterministic=True)
 
@@ -75,11 +85,18 @@ def deploy_in_simulation():
                 if terminated or truncated:
                     break
 
-            distance = info["distance"]
-            result = "到达目标!" if distance < 0.05 else "未到达"
-            print(f"  结果: {result} | "
-                  f"最终距离: {distance:.4f}m | "
-                  f"奖励: {total_reward:.1f}")
+            if task == "grasp":
+                result = "抓取成功!" if info["is_success"] else "未抓起"
+                print(
+                    f"  结果: {result} | 夹住: {info['grasped']} | "
+                    f"抬高: {info['lift_height'] * 100:.1f}cm | "
+                    f"奖励: {total_reward:.1f}")
+            else:
+                distance = info["distance"]
+                result = "到达目标!" if distance < 0.05 else "未到达"
+                print(f"  结果: {result} | "
+                      f"最终距离: {distance:.4f}m | "
+                      f"奖励: {total_reward:.1f}")
 
             time.sleep(1.0)
 
@@ -115,6 +132,15 @@ def show_deployment_comparison():
     print("=" * 60)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Deploy the reaching or grasping TD3 policy in PyBullet.")
+    parser.add_argument(
+        "--task", choices=("reach", "grasp"), default="reach")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     show_deployment_comparison()
-    deploy_in_simulation()
+    deploy_in_simulation(args.task)
