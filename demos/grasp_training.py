@@ -242,12 +242,12 @@ class GraspTrainingConfig:
             # the fixed-pose warm start.
             curriculum=(1.0, 1.0, 1.0, 1.0),
             randomization_curriculum=(0.0, 0.0, 0.0, 0.0),
-            pose_randomization_curriculum=(0.25, 0.50, 0.75, 1.0),
-            rl_phase_steps=(15_000, 20_000, 30_000, 45_000),
+            pose_randomization_curriculum=(0.50, 0.75, 1.0, 1.0),
+            rl_phase_steps=(15_000, 25_000, 35_000, 50_000),
             eval_episodes=200,
             target_success_rate=0.70,
-            actor_learning_rate=1e-6,
-            anchor_coefficient=10.0,
+            actor_learning_rate=2e-6,
+            anchor_coefficient=2.0,
         )
 
     @classmethod
@@ -344,6 +344,7 @@ class RobotGraspEnv(gym.Env):
         self.step_count = 0
         self.hold_steps = 0
         self.previous_distance = 0.0
+        self.previous_yaw_error = 0.0
         self.previous_cube_height = CUBE_REST_Z
         self.previous_action = np.zeros(8, dtype=np.float32)
         self.command_history = np.zeros(
@@ -516,6 +517,7 @@ class RobotGraspEnv(gym.Env):
         self.lift_target_pos = self.cube_start_pos + np.array(
             [0.0, 0.0, TEACHER_LIFT_HEIGHT])
         self.previous_distance = self._distance_to_cube()
+        self.previous_yaw_error = abs(self._get_gripper_cube_yaw_error())
         self.previous_cube_height = float(self.cube_start_pos[2])
         info = self._info(self.previous_distance)
         return self._get_observation(), info
@@ -588,8 +590,10 @@ class RobotGraspEnv(gym.Env):
         lift_progress = cube_height - self.previous_cube_height
         smoothness_cost = np.square(action - self.previous_action).sum()
         yaw_error = self._get_gripper_cube_yaw_error()
+        yaw_error_abs = abs(yaw_error)
+        yaw_progress = self.previous_yaw_error - yaw_error_abs
         yaw_alignment = 0.5 * (math.cos(4.0 * yaw_error) + 1.0)
-        alignment_gate = max(0.0, 1.0 - distance / SAFE_CLOSE_DISTANCE)
+        alignment_gate = max(0.0, 1.0 - distance / FINE_ALIGNMENT_DISTANCE)
 
         # Reward stages: approach < bilateral contact < lift < stable hold.
         reward = (
@@ -600,12 +604,13 @@ class RobotGraspEnv(gym.Env):
         )
         reward += 0.08 * (int(left_contact) + int(right_contact))
         if self.pose_randomization > 0.0 and not self.is_grasped:
-            # A square is equivalent every 90 degrees.  Reward the closest
-            # face-normal alignment only near the object, where wrist
-            # rotation matters for a centred two-finger pinch.
-            reward += 0.12 * alignment_gate * yaw_alignment
+            # Reward reducing the square-symmetric yaw error instead of
+            # paying an absolute alignment bonus that can be exploited by
+            # waiting near the cube.  Closing while misaligned is explicitly
+            # discouraged so the policy learns a pre-grasp rotation phase.
+            reward += 10.0 * yaw_progress
             reward -= (
-                0.30
+                0.80
                 * max(float(action[7]), 0.0)
                 * alignment_gate
                 * (1.0 - yaw_alignment)
@@ -646,6 +651,7 @@ class RobotGraspEnv(gym.Env):
         truncated = self.step_count >= self.max_steps
 
         self.previous_distance = distance
+        self.previous_yaw_error = yaw_error_abs
         self.previous_cube_height = cube_height
         self.previous_action = action.copy()
         return (
@@ -688,9 +694,14 @@ class RobotGraspEnv(gym.Env):
                 + desired_grasp_center
                 - self._get_grasp_center()
             )
-            if distance < GRASP_DISTANCE:
+            yaw_ready = (
+                self.pose_randomization <= 0.0
+                or abs(self._get_gripper_cube_yaw_error())
+                < math.radians(8.0)
+            )
+            if distance < GRASP_DISTANCE and yaw_ready:
                 self.teacher_closing = True
-            elif distance > 2.0 * GRASP_DISTANCE:
+            elif distance > 2.0 * GRASP_DISTANCE or not yaw_ready:
                 self.teacher_closing = False
             gripper_action = 1.0 if self.teacher_closing else -1.0
 
@@ -712,8 +723,12 @@ class RobotGraspEnv(gym.Env):
                 -math.pi - math.radians(20.0) * tilt_blend,
                 0.0,
             ])
+            # A square has four equivalent face-normal directions.  Command
+            # only the nearest correction in [-45, 45] degrees instead of
+            # rotating the wrist through the cube's full visual yaw.
+            yaw_correction = self._wrap_square_yaw(self.cube_yaw)
             yaw_orientation = p.getQuaternionFromEuler(
-                [0.0, 0.0, self.cube_yaw])
+                [0.0, 0.0, yaw_correction])
             target_orientation = p.multiplyTransforms(
                 [0.0, 0.0, 0.0],
                 yaw_orientation,
@@ -773,9 +788,21 @@ class RobotGraspEnv(gym.Env):
             self.cube_friction = blend(0.55, 0.35, 0.80)
             self.finger_friction = blend(1.00, 0.70, 1.30)
             self.gripper_motor_force = blend(60.0, 45.0, 75.0)
-        pose_severity = max(severity, self.pose_randomization)
-        self.cube_yaw = pose_severity * float(
-            self.np_random.uniform(-math.pi / 4, math.pi / 4))
+        if self.pose_randomization > 0.0:
+            # Sample a full visual rotation while curriculum severity controls
+            # only the physically unique residual within one 90-degree square
+            # symmetry sector.  At severity 1 this is uniform over [-pi, pi].
+            raw_yaw = float(self.np_random.uniform(-math.pi, math.pi))
+            quadrant = round(raw_yaw / (math.pi / 2.0)) * (math.pi / 2.0)
+            residual = self._wrap_square_yaw(raw_yaw)
+            self.cube_yaw = float(
+                (quadrant + self.pose_randomization * residual + math.pi)
+                % (2.0 * math.pi)
+                - math.pi
+            )
+        else:
+            self.cube_yaw = severity * float(
+                self.np_random.uniform(-math.pi / 4, math.pi / 4))
         self.motor_force = blend(300.0, 240.0, 360.0)
         self.motor_velocity = blend(1.5, 1.2, 1.8)
 
@@ -1007,11 +1034,14 @@ class RobotGraspEnv(gym.Env):
         ]
         jaw_axis = tips[1] - tips[0]
         gripper_yaw = math.atan2(float(jaw_axis[1]), float(jaw_axis[0]))
+        return self._wrap_square_yaw(gripper_yaw - self.cube_yaw)
+
+    @staticmethod
+    def _wrap_square_yaw(yaw: float) -> float:
+        """Wrap an angle into the unique [-45, 45) degree square sector."""
+
         period = math.pi / 2.0
-        return float(
-            (gripper_yaw - self.cube_yaw + period / 2.0) % period
-            - period / 2.0
-        )
+        return float((yaw + period / 2.0) % period - period / 2.0)
 
     def _get_ee_pos(self) -> np.ndarray:
         state = p.getLinkState(
@@ -1075,7 +1105,7 @@ class RobotGraspEnv(gym.Env):
             yaw_error = self._get_gripper_cube_yaw_error()
             observation = np.concatenate([
                 observation,
-                interaction_gate * np.array([
+                np.array([
                     math.sin(4.0 * yaw_error),
                     math.cos(4.0 * yaw_error),
                 ]),
@@ -1583,7 +1613,9 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             decay_updates=sum(config.rl_phase_steps),
             balance_phases=True,
             action_weights=GRASP_BC_ACTION_WEIGHTS,
-            q_filter=True,
+            # The pose teacher has already been validated by physical rollout.
+            # Do not let an immature critic reject its pre-grasp yaw labels.
+            q_filter=not pose_randomized,
             hold_state_index=22,
             hold_action_index=7,
             hold_target=1.0,

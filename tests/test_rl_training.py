@@ -75,7 +75,7 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
         config = GraspTrainingConfig.physical_pose(seed=9)
         self.assertEqual(config.seed, 9)
         self.assertEqual(
-            config.pose_randomization_curriculum, (0.25, 0.50, 0.75, 1.0))
+            config.pose_randomization_curriculum, (0.50, 0.75, 1.0, 1.0))
         self.assertEqual(
             len(config.pose_randomization_curriculum),
             len(config.rl_phase_steps),
@@ -198,15 +198,43 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
             self.assertTrue(all(0.31 <= item["cube_x"] <= 0.49 for item in samples))
             self.assertTrue(all(-0.11 <= item["cube_y"] <= 0.11 for item in samples))
             self.assertTrue(all(
-                abs(item["cube_yaw"]) <= np.pi / 4 for item in samples))
+                abs(item["cube_yaw"]) <= np.pi for item in samples))
             self.assertGreater(
                 max(item["cube_yaw"] for item in samples)
                 - min(item["cube_yaw"] for item in samples),
-                1.0,
+                4.0,
             )
             self.assertTrue(all(item["cube_mass"] == 0.20 for item in samples))
             self.assertTrue(all(
                 item["cube_friction"] == 0.55 for item in samples))
+        finally:
+            env.close()
+
+    def test_pose_yaw_observation_is_available_before_near_contact(self):
+        env = RobotGraspEnv(
+            grasp_constraint_force=0.0,
+            pose_randomization=1.0,
+            observe_physical_residual=True,
+            observe_cube_yaw=True,
+            max_steps=2,
+        )
+        try:
+            for seed in range(800, 850):
+                observation, _ = env.reset(seed=seed)
+                if env._distance_to_cube() >= 0.075:
+                    yaw_error = env._get_gripper_cube_yaw_error()
+                    np.testing.assert_allclose(
+                        observation[-2:],
+                        [
+                            np.sin(4.0 * yaw_error),
+                            np.cos(4.0 * yaw_error),
+                        ],
+                        atol=1e-6,
+                    )
+                    self.assertFalse(np.array_equal(observation[-2:], 0.0))
+                    break
+            else:
+                self.fail("expected at least one reset outside the contact gate")
         finally:
             env.close()
 
