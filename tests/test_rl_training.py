@@ -75,7 +75,12 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
         config = GraspTrainingConfig.physical_pose(seed=9)
         self.assertEqual(config.seed, 9)
         self.assertEqual(
-            config.pose_randomization_curriculum, (0.25, 0.50, 1.0))
+            config.pose_randomization_curriculum, (0.25, 0.50, 0.75, 1.0))
+        self.assertEqual(
+            len(config.pose_randomization_curriculum),
+            len(config.rl_phase_steps),
+        )
+        self.assertEqual(config.eval_episodes, 200)
         self.assertEqual(config.grasp_constraint_force, 0.0)
 
     def test_checkpoint_score_keeps_partial_grasp_progress(self):
@@ -205,6 +210,28 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
         finally:
             env.close()
 
+    def test_pose_observation_reports_relative_square_yaw_alignment(self):
+        env = RobotGraspEnv(
+            grasp_constraint_force=0.0,
+            pose_randomization=1.0,
+            observe_physical_residual=True,
+            observe_cube_yaw=True,
+            max_steps=2,
+        )
+        try:
+            observation, info = env.reset(seed=20260901)
+            self.assertLess(env._distance_to_cube(), 0.075)
+            yaw_error = env._get_gripper_cube_yaw_error()
+            np.testing.assert_allclose(
+                observation[-2:],
+                [np.sin(4.0 * yaw_error), np.cos(4.0 * yaw_error)],
+                atol=1e-6,
+            )
+            self.assertAlmostEqual(
+                info["gripper_cube_yaw_error"], yaw_error)
+        finally:
+            env.close()
+
     def test_physical_center_grasp_lifts_but_edge_grasp_slips(self):
         env = RobotGraspEnv(grasp_constraint_force=0.0)
 
@@ -252,6 +279,34 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
             histories = generator.uniform(
                 -1.0, 1.0, size=(16, 16)).astype(np.float32)
             expanded = np.concatenate([observations, histories], axis=1)
+            source_actions, _ = source.predict(
+                observations, deterministic=True)
+            target_actions, _ = target.predict(expanded, deterministic=True)
+            np.testing.assert_array_equal(source_actions, target_actions)
+        finally:
+            source_env.close()
+            target_env.close()
+
+    def test_policy_expansion_accepts_physical_residual_plus_yaw(self):
+        source_env = RobotGraspEnv(
+            observe_physical_residual=True, max_steps=2)
+        target_env = RobotGraspEnv(
+            observe_physical_residual=True,
+            observe_cube_yaw=True,
+            max_steps=2,
+        )
+        try:
+            source = build_grasp_td3(source_env, seed=13)
+            target = build_grasp_td3(target_env, seed=14)
+            with tempfile.TemporaryDirectory() as directory:
+                model_path = Path(directory) / "physical_policy.zip"
+                source.save(model_path)
+                warm_start_grasp_model(target, model_path)
+
+            generator = np.random.default_rng(43)
+            observations = generator.normal(size=(16, 48)).astype(np.float32)
+            yaws = generator.uniform(-1.0, 1.0, size=(16, 2)).astype(np.float32)
+            expanded = np.concatenate([observations, yaws], axis=1)
             source_actions, _ = source.predict(
                 observations, deterministic=True)
             target_actions, _ = target.predict(expanded, deterministic=True)

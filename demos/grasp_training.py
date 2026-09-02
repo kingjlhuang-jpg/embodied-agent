@@ -235,8 +235,19 @@ class GraspTrainingConfig:
 
         return replace(
             cls.physical(seed),
-            pose_randomization_curriculum=(0.25, 0.50, 1.0),
+            # Keep one continuous optimization trajectory while progressively
+            # expanding the pose distribution.  Earlier versions evaluated
+            # every partial-curriculum stage on the full workspace and rolled
+            # it back immediately, so later stages repeatedly restarted from
+            # the fixed-pose warm start.
+            curriculum=(1.0, 1.0, 1.0, 1.0),
+            randomization_curriculum=(0.0, 0.0, 0.0, 0.0),
+            pose_randomization_curriculum=(0.25, 0.50, 0.75, 1.0),
+            rl_phase_steps=(15_000, 20_000, 30_000, 45_000),
+            eval_episodes=200,
             target_success_rate=0.70,
+            actor_learning_rate=1e-6,
+            anchor_coefficient=10.0,
         )
 
     @classmethod
@@ -576,6 +587,9 @@ class RobotGraspEnv(gym.Env):
         approach_progress = self.previous_distance - distance
         lift_progress = cube_height - self.previous_cube_height
         smoothness_cost = np.square(action - self.previous_action).sum()
+        yaw_error = self._get_gripper_cube_yaw_error()
+        yaw_alignment = 0.5 * (math.cos(4.0 * yaw_error) + 1.0)
+        alignment_gate = max(0.0, 1.0 - distance / SAFE_CLOSE_DISTANCE)
 
         # Reward stages: approach < bilateral contact < lift < stable hold.
         reward = (
@@ -585,6 +599,17 @@ class RobotGraspEnv(gym.Env):
             - 0.001 * smoothness_cost
         )
         reward += 0.08 * (int(left_contact) + int(right_contact))
+        if self.pose_randomization > 0.0 and not self.is_grasped:
+            # A square is equivalent every 90 degrees.  Reward the closest
+            # face-normal alignment only near the object, where wrist
+            # rotation matters for a centred two-finger pinch.
+            reward += 0.12 * alignment_gate * yaw_alignment
+            reward -= (
+                0.30
+                * max(float(action[7]), 0.0)
+                * alignment_gate
+                * (1.0 - yaw_alignment)
+            )
         premature_close = (
             max(float(action[7]), 0.0)
             * max(distance - SAFE_CLOSE_DISTANCE, 0.0)
@@ -593,6 +618,8 @@ class RobotGraspEnv(gym.Env):
         reward -= 0.25 * premature_close
         if left_contact and right_contact:
             reward += 0.35
+            if self.pose_randomization > 0.0:
+                reward += 0.40 * yaw_alignment
         if newly_grasped:
             reward += 4.0
         if self.is_grasped:
@@ -672,11 +699,32 @@ class RobotGraspEnv(gym.Env):
                 self.robot_id, joint, physicsClientId=self.client)[0]
             for joint in self._ik_joints
         ]
+        target_orientation = self._downward_orientation
+        if self.pose_randomization > 0.0:
+            # Strictly vertical IK approaches a wrist singularity at the far
+            # edge of this Kuka workspace.  Gradually tilt toward the robot by
+            # at most 20 degrees only beyond x=0.43 m, which preserves the
+            # central grasp while producing reachable labels at the edge.
+            tilt_blend = float(np.clip(
+                (cube_position[0] - 0.43) / 0.03, 0.0, 1.0))
+            downward_orientation = p.getQuaternionFromEuler([
+                0.0,
+                -math.pi - math.radians(20.0) * tilt_blend,
+                0.0,
+            ])
+            yaw_orientation = p.getQuaternionFromEuler(
+                [0.0, 0.0, self.cube_yaw])
+            target_orientation = p.multiplyTransforms(
+                [0.0, 0.0, 0.0],
+                yaw_orientation,
+                [0.0, 0.0, 0.0],
+                downward_orientation,
+            )[1]
         solution = p.calculateInverseKinematics(
             self.robot_id,
             self.END_EFFECTOR_LINK,
             target_position,
-            self._downward_orientation,
+            target_orientation,
             lowerLimits=self._ik_lower,
             upperLimits=self._ik_upper,
             jointRanges=self._ik_ranges,
@@ -945,6 +993,26 @@ class RobotGraspEnv(gym.Env):
         ]
         return np.mean(np.asarray(tips), axis=0)
 
+    def _get_gripper_cube_yaw_error(self) -> float:
+        """Signed jaw-to-cube yaw error, respecting square symmetry."""
+
+        tips = [
+            np.asarray(p.getLinkState(
+                self.robot_id,
+                link,
+                computeForwardKinematics=True,
+                physicsClientId=self.client,
+            )[0])
+            for link in (10, 13)
+        ]
+        jaw_axis = tips[1] - tips[0]
+        gripper_yaw = math.atan2(float(jaw_axis[1]), float(jaw_axis[0]))
+        period = math.pi / 2.0
+        return float(
+            (gripper_yaw - self.cube_yaw + period / 2.0) % period
+            - period / 2.0
+        )
+
     def _get_ee_pos(self) -> np.ndarray:
         state = p.getLinkState(
             self.robot_id,
@@ -1004,11 +1072,12 @@ class RobotGraspEnv(gym.Env):
                 observation[:BASE_OBSERVATION_SIZE] * interaction_gate,
             ])
         if self.observe_cube_yaw:
+            yaw_error = self._get_gripper_cube_yaw_error()
             observation = np.concatenate([
                 observation,
                 interaction_gate * np.array([
-                    math.sin(self.cube_yaw),
-                    math.cos(self.cube_yaw),
+                    math.sin(4.0 * yaw_error),
+                    math.cos(4.0 * yaw_error),
                 ]),
             ])
         return np.clip(observation, -5.0, 5.0).astype(np.float32)
@@ -1031,6 +1100,7 @@ class RobotGraspEnv(gym.Env):
             "cube_mass": self.cube_mass,
             "cube_friction": self.cube_friction,
             "cube_yaw": self.cube_yaw,
+            "gripper_cube_yaw_error": self._get_gripper_cube_yaw_error(),
             "cube_x": float(self.cube_start_pos[0]),
             "cube_y": float(self.cube_start_pos[1]),
             "action_delay_steps": self.action_delay_steps,
@@ -1080,7 +1150,7 @@ def warm_start_grasp_model(
     model: GuidedTD3,
     source_path: Path,
 ) -> None:
-    """Expand a 24-D grasp policy with zeroed residual inputs without drift."""
+    """Expand a grasp policy with zeroed appended inputs without drift."""
 
     source = GuidedTD3.load(source_path, device=model.device)
     source_observation_size = int(source.observation_space.shape[0])
@@ -1089,10 +1159,7 @@ def warm_start_grasp_model(
     if source_observation_size == target_observation_size:
         model.set_parameters(source_path, exact_match=True, device=model.device)
         return
-    if (
-        source_observation_size != BASE_OBSERVATION_SIZE
-        or target_observation_size <= source_observation_size
-    ):
+    if target_observation_size <= source_observation_size:
         raise ValueError(
             "unsupported grasp-policy observation expansion: "
             f"{source_observation_size} -> {target_observation_size}"
@@ -1390,8 +1457,15 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
     best_checkpoint_score = (-1.0,) * 5
 
     try:
-        if (robust or physical) and GRASP_MODEL_PATH.exists():
-            warm_start_grasp_model(model, GRASP_MODEL_PATH)
+        warm_start_path = (
+            POSE_PHYSICAL_GRASP_MODEL_PATH
+            if physical and pose_randomized and POSE_PHYSICAL_GRASP_MODEL_PATH.exists()
+            else PHYSICAL_GRASP_MODEL_PATH
+            if physical and pose_randomized and PHYSICAL_GRASP_MODEL_PATH.exists()
+            else GRASP_MODEL_PATH
+        )
+        if (robust or physical) and warm_start_path.exists():
+            warm_start_grasp_model(model, warm_start_path)
             metrics = evaluate_grasp(
                 model,
                 episodes=config.eval_episodes,
@@ -1516,7 +1590,10 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             hold_coefficient=config.hold_coefficient,
             anchor_coefficient=config.anchor_coefficient,
             actor_trainable_suffix_start=(
-                BASE_OBSERVATION_SIZE if (robust or physical) else None),
+                BASE_OBSERVATION_SIZE
+                if (robust or physical) and not pose_randomized
+                else None
+            ),
         )
         model.rl_weight = config.rl_weight
         model.actor_learning_rate = config.actor_learning_rate
@@ -1589,12 +1666,18 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 best_success_rate = float(metrics["success_rate"])
                 best_checkpoint_score = checkpoint_score
                 model.save(best_model_path)
-            else:
+            elif not pose_randomized:
                 model.set_parameters(
                     best_model_path, exact_match=True, device=model.device)
                 model.rl_weight *= 0.5
                 print(
                     "      未超过最佳检查点，已恢复最佳权重并降低RL更新权重。",
+                    flush=True,
+                )
+            else:
+                print(
+                    "      当前阶段尚未超过全范围最佳检查点；"
+                    "保留课程权重进入下一姿态阶段。",
                     flush=True,
                 )
             if (

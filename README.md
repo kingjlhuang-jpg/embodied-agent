@@ -119,10 +119,11 @@ python demos/02_rl_training.py --task grasp --physical --random-pose
 75 回合保护集，因此最终保留的是无损扩展后的最佳基线，而不是较差的新权重。
 
 `--random-pose` 将纯物理任务扩大到 `x=0.31～0.49 m`、`y=-0.11～0.11 m`
-和 `yaw=-45°～45°`，并把方块角度的正弦/余弦加入策略观测。该任务使用独立的
-`pose_physical_grasp_policy.zip`；1000 回合全范围测试为 453/1000（45.3%），
-固定约束激活次数仍为 0。较低成功率反映了工作区边缘、旋转方块和真实滑落
-带来的难度，不会覆盖固定姿态下 85.8% 的物理模型。
+和 `yaw=-45°～45°`。策略额外观测具有方块 90° 对称性的夹爪—方块相对偏航
+误差，并按 0.25/0.50/0.75/1.0 连续课程训练。该任务使用独立的
+`pose_physical_grasp_policy.zip`；1000 回合全范围测试为 459/1000（45.9%），
+固定约束激活次数仍为 0。较低成功率主要来自 `x>0.43 m` 的远端可达性和
+接触后真实滑落，不会覆盖固定姿态下 85.8% 的物理模型。
 
 ### Demo 3: 模型部署
 
@@ -141,6 +142,7 @@ python demos/03_deploy_model.py --task grasp
 python demos/03_deploy_model.py --task grasp --robust
 python demos/03_deploy_model.py --task grasp --physical
 python demos/03_deploy_model.py --task grasp --physical --random-pose
+python demos/03_deploy_model.py --task grasp --physical --random-pose --episodes 10
 ```
 
 ### Demo 4: 宇树 G1 人形机器人动作

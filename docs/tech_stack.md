@@ -35,7 +35,7 @@ Python 3.9+ ─── PyBullet (仿真) ─── PyTorch/TD3+BC (AI) ─── 
 | **MLP 策略网络 / grasp** | 约74K | 关节+夹爪+方块+接触+抓取状态(24维) | 手臂7维+夹爪1维 | 接触抓取 |
 | **MLP 策略网络 / robust grasp** | 约78K | grasp状态+最近2步动作(40维) | 手臂7维+夹爪1维 | 延迟/物理随机化抓取 |
 | **MLP 策略网络 / physical grasp** | 约80K | grasp状态+接触阶段残差(48维) | 手臂7维+夹爪1维 | 无固定约束的摩擦抓取 |
-| **MLP 策略网络 / pose physical** | 约80K | physical状态+sin/cos(yaw)(50维) | 手臂7维+夹爪1维 | 扩大位置和±45°方块姿态 |
+| **MLP 策略网络 / pose physical** | 约80K | physical状态+相对yaw误差(50维) | 手臂7维+夹爪1维 | 扩大位置和±45°方块姿态 |
 | **EEGNet / CNN** | 100K-1M | RGB 图像 | 动作 | 视觉感知 |
 | **RT-2** (Google) | 55B | 图像+语言 | 动作token | VLA 先驱 |
 | **OpenVLA** (Stanford) | 7B | 图像+语言 | 动作 | 开源 VLA |

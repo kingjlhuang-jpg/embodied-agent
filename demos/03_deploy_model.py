@@ -37,6 +37,7 @@ def deploy_in_simulation(
     robust=False,
     physical=False,
     random_pose=False,
+    episodes=None,
 ):
     """在仿真中部署AI模型"""
     print("=" * 60)
@@ -92,7 +93,8 @@ def deploy_in_simulation(
 
     try:
         episode = 0
-        while True:
+        successes = 0
+        while episodes is None or episode < episodes:
             episode += 1
             obs, _ = env.reset()
             total_reward = 0
@@ -123,6 +125,7 @@ def deploy_in_simulation(
 
             if task == "grasp":
                 result = "抓取成功!" if info["is_success"] else "未抓起"
+                successes += int(info["is_success"])
                 print(
                     f"  结果: {result} | 夹住: {info['grasped']} | "
                     f"抬高: {info['lift_height'] * 100:.1f}cm | "
@@ -130,11 +133,17 @@ def deploy_in_simulation(
             else:
                 distance = info["distance"]
                 result = "到达目标!" if distance < 0.05 else "未到达"
+                successes += int(distance < 0.05)
                 print(f"  结果: {result} | "
                       f"最终距离: {distance:.4f}m | "
                       f"奖励: {total_reward:.1f}")
 
             time.sleep(1.0)
+
+        print(
+            f"\n运行汇总: 成功 {successes}/{episode}，"
+            f"成功率 {successes / episode:.1%}"
+        )
 
     except KeyboardInterrupt:
         print("\n部署演示结束。")
@@ -182,6 +191,9 @@ def parse_args():
     parser.add_argument(
         "--random-pose", action="store_true",
         help="use the wider-position, randomized-yaw physical model")
+    parser.add_argument(
+        "--episodes", type=int,
+        help="stop automatically after this many deployment episodes")
     return parser.parse_args()
 
 
@@ -195,10 +207,13 @@ if __name__ == "__main__":
         raise SystemExit("choose either --physical or --robust")
     if args.random_pose and not args.physical:
         raise SystemExit("--random-pose requires --task grasp --physical")
+    if args.episodes is not None and args.episodes <= 0:
+        raise SystemExit("--episodes must be greater than zero")
     show_deployment_comparison()
     deploy_in_simulation(
         args.task,
         robust=args.robust,
         physical=args.physical,
         random_pose=args.random_pose,
+        episodes=args.episodes,
     )
