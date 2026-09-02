@@ -68,7 +68,15 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
         config = GraspTrainingConfig.physical(seed=8)
         self.assertEqual(config.seed, 8)
         self.assertEqual(config.grasp_constraint_force, 0.0)
+        self.assertEqual(config.pose_randomization_curriculum, (0.0, 0.0, 0.0))
         self.assertEqual(config.final_eval_episodes, 1_000)
+
+    def test_physical_pose_config_uses_full_pose_evaluation(self):
+        config = GraspTrainingConfig.physical_pose(seed=9)
+        self.assertEqual(config.seed, 9)
+        self.assertEqual(
+            config.pose_randomization_curriculum, (0.25, 0.50, 1.0))
+        self.assertEqual(config.grasp_constraint_force, 0.0)
 
     def test_checkpoint_score_keeps_partial_grasp_progress(self):
         base = {
@@ -167,6 +175,33 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
             self.assertEqual(observation.shape, (48,))
             if env._distance_to_cube() >= 0.075:
                 np.testing.assert_array_equal(observation[-24:], 0.0)
+        finally:
+            env.close()
+
+    def test_physical_pose_randomization_expands_position_and_yaw_only(self):
+        env = RobotGraspEnv(
+            grasp_constraint_force=0.0,
+            pose_randomization=1.0,
+            observe_physical_residual=True,
+            observe_cube_yaw=True,
+            max_steps=2,
+        )
+        try:
+            resets = [env.reset(seed=700 + index) for index in range(20)]
+            samples = [item[1] for item in resets]
+            self.assertTrue(all(item[0].shape == (50,) for item in resets))
+            self.assertTrue(all(0.31 <= item["cube_x"] <= 0.49 for item in samples))
+            self.assertTrue(all(-0.11 <= item["cube_y"] <= 0.11 for item in samples))
+            self.assertTrue(all(
+                abs(item["cube_yaw"]) <= np.pi / 4 for item in samples))
+            self.assertGreater(
+                max(item["cube_yaw"] for item in samples)
+                - min(item["cube_yaw"] for item in samples),
+                1.0,
+            )
+            self.assertTrue(all(item["cube_mass"] == 0.20 for item in samples))
+            self.assertTrue(all(
+                item["cube_friction"] == 0.55 for item in samples))
         finally:
             env.close()
 

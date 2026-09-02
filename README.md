@@ -88,6 +88,9 @@ python demos/02_rl_training.py --task grasp --physical
 
 # 快速验证物理抓取流水线
 python demos/02_rl_training.py --task grasp --physical --quick
+
+# 扩大位置并随机旋转方块的纯物理任务
+python demos/02_rl_training.py --task grasp --physical --random-pose
 ```
 
 抓取奖励按任务阶段递增：靠近方块获得小奖励，左右手指同时接触获得中等奖励，
@@ -115,6 +118,12 @@ python demos/02_rl_training.py --task grasp --physical --quick
 `physical_grasp_policy.zip`，不会覆盖辅助抓取模型。本轮在线候选没有超过
 75 回合保护集，因此最终保留的是无损扩展后的最佳基线，而不是较差的新权重。
 
+`--random-pose` 将纯物理任务扩大到 `x=0.31～0.49 m`、`y=-0.11～0.11 m`
+和 `yaw=-45°～45°`，并把方块角度的正弦/余弦加入策略观测。该任务使用独立的
+`pose_physical_grasp_policy.zip`；1000 回合全范围测试为 453/1000（45.3%），
+固定约束激活次数仍为 0。较低成功率反映了工作区边缘、旋转方块和真实滑落
+带来的难度，不会覆盖固定姿态下 85.8% 的物理模型。
+
 ### Demo 3: 模型部署
 
 加载训练好的模型，在仿真中运行，展示仿真 vs 真机的代码对比：
@@ -131,6 +140,7 @@ python demos/03_deploy_model.py --task reach
 python demos/03_deploy_model.py --task grasp
 python demos/03_deploy_model.py --task grasp --robust
 python demos/03_deploy_model.py --task grasp --physical
+python demos/03_deploy_model.py --task grasp --physical --random-pose
 ```
 
 ### Demo 4: 宇树 G1 人形机器人动作

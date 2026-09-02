@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import gymnasium as gym
@@ -62,6 +62,11 @@ ROBUST_GRASP_METRICS_PATH = Path("robust_grasp_training_metrics.json")
 PHYSICAL_GRASP_MODEL_PATH = Path("physical_grasp_policy.zip")
 BEST_PHYSICAL_GRASP_MODEL_PATH = Path("best_physical_grasp_policy.zip")
 PHYSICAL_GRASP_METRICS_PATH = Path("physical_grasp_training_metrics.json")
+POSE_PHYSICAL_GRASP_MODEL_PATH = Path("pose_physical_grasp_policy.zip")
+BEST_POSE_PHYSICAL_GRASP_MODEL_PATH = Path(
+    "best_pose_physical_grasp_policy.zip")
+POSE_PHYSICAL_GRASP_METRICS_PATH = Path(
+    "pose_physical_grasp_training_metrics.json")
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class GraspTrainingConfig:
     rl_phase_steps: tuple[int, ...] = (15_000, 25_000, 40_000)
     curriculum: tuple[float, ...] = (1.00, 1.00, 1.00)
     randomization_curriculum: tuple[float, ...] = (0.0, 0.0, 0.0)
+    pose_randomization_curriculum: tuple[float, ...] = (0.0, 0.0, 0.0)
     eval_episodes: int = 50
     final_eval_episodes: int = 100
     target_success_rate: float = 0.95
@@ -105,6 +111,7 @@ class GraspTrainingConfig:
             rl_phase_steps=(750,),
             curriculum=(0.35,),
             randomization_curriculum=(0.0,),
+            pose_randomization_curriculum=(0.0,),
             eval_episodes=10,
             final_eval_episodes=20,
             target_success_rate=1.0,
@@ -125,6 +132,7 @@ class GraspTrainingConfig:
             rl_phase_steps=(10_000, 15_000, 25_000),
             curriculum=(1.0, 1.0, 1.0),
             randomization_curriculum=(0.35, 0.70, 1.0),
+            pose_randomization_curriculum=(0.0, 0.0, 0.0),
             eval_episodes=75,
             final_eval_episodes=1_000,
             target_success_rate=0.95,
@@ -151,6 +159,7 @@ class GraspTrainingConfig:
             rl_phase_steps=(1_000,),
             curriculum=(1.0,),
             randomization_curriculum=(0.35,),
+            pose_randomization_curriculum=(0.0,),
             eval_episodes=10,
             final_eval_episodes=20,
             target_success_rate=1.0,
@@ -177,6 +186,7 @@ class GraspTrainingConfig:
             rl_phase_steps=(10_000, 15_000, 25_000),
             curriculum=(1.0, 1.0, 1.0),
             randomization_curriculum=(0.0, 0.0, 0.0),
+            pose_randomization_curriculum=(0.0, 0.0, 0.0),
             eval_episodes=75,
             final_eval_episodes=1_000,
             target_success_rate=0.90,
@@ -205,6 +215,7 @@ class GraspTrainingConfig:
             rl_phase_steps=(1_000,),
             curriculum=(1.0,),
             randomization_curriculum=(0.0,),
+            pose_randomization_curriculum=(0.0,),
             eval_episodes=10,
             final_eval_episodes=20,
             target_success_rate=1.0,
@@ -216,6 +227,25 @@ class GraspTrainingConfig:
             actor_learning_rate=1e-7,
             grasp_constraint_force=0.0,
             failure_only_dagger=True,
+        )
+
+    @classmethod
+    def physical_pose(cls, seed: int = 20260901) -> "GraspTrainingConfig":
+        """Train friction grasping over wider XY positions and cube yaws."""
+
+        return replace(
+            cls.physical(seed),
+            pose_randomization_curriculum=(0.25, 0.50, 1.0),
+            target_success_rate=0.70,
+        )
+
+    @classmethod
+    def quick_physical_pose(cls, seed: int = 20260901) -> "GraspTrainingConfig":
+        """Smoke-test the randomized-pose physical grasp pipeline."""
+
+        return replace(
+            cls.quick_physical(seed),
+            pose_randomization_curriculum=(0.50,),
         )
 
 
@@ -246,8 +276,10 @@ class RobotGraspEnv(gym.Env):
         render: bool | None = None,
         difficulty: float = 1.0,
         randomization: float = 0.0,
+        pose_randomization: float = 0.0,
         observe_action_history: bool = False,
         observe_physical_residual: bool = False,
+        observe_cube_yaw: bool = False,
         grasp_constraint_force: float = 300.0,
         max_steps: int = 300,
     ):
@@ -260,8 +292,11 @@ class RobotGraspEnv(gym.Env):
         self.render_mode = render_mode
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
         self.randomization = float(np.clip(randomization, 0.0, 1.0))
+        self.pose_randomization = float(
+            np.clip(pose_randomization, 0.0, 1.0))
         self.observe_action_history = bool(observe_action_history)
         self.observe_physical_residual = bool(observe_physical_residual)
+        self.observe_cube_yaw = bool(observe_cube_yaw)
         self.grasp_constraint_force = max(float(grasp_constraint_force), 0.0)
         self.max_steps = int(max_steps)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(8,), dtype=np.float32)
@@ -270,6 +305,8 @@ class RobotGraspEnv(gym.Env):
             observation_size += ACTION_HISTORY_STEPS * self.action_space.shape[0]
         if self.observe_physical_residual:
             observation_size += BASE_OBSERVATION_SIZE
+        if self.observe_cube_yaw:
+            observation_size += 2
         self.observation_space = spaces.Box(
             -5.0, 5.0, shape=(observation_size,), dtype=np.float32)
 
@@ -340,6 +377,12 @@ class RobotGraspEnv(gym.Env):
 
         self.randomization = float(np.clip(randomization, 0.0, 1.0))
 
+    def set_pose_randomization(self, pose_randomization: float) -> None:
+        """Set object position/yaw randomization for subsequent resets."""
+
+        self.pose_randomization = float(
+            np.clip(pose_randomization, 0.0, 1.0))
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         del options
@@ -399,8 +442,12 @@ class RobotGraspEnv(gym.Env):
                 physicsClientId=self.client,
             )
 
-        cube_x = 0.40 + self.difficulty * self.np_random.uniform(-0.055, 0.055)
-        cube_y = self.difficulty * self.np_random.uniform(-0.075, 0.075)
+        cube_x_span = 0.055 + 0.035 * self.pose_randomization
+        cube_y_span = 0.075 + 0.035 * self.pose_randomization
+        cube_x = 0.40 + self.difficulty * self.np_random.uniform(
+            -cube_x_span, cube_x_span)
+        cube_y = self.difficulty * self.np_random.uniform(
+            -cube_y_span, cube_y_span)
         cube_position = np.array([
             cube_x,
             cube_y,
@@ -678,7 +725,8 @@ class RobotGraspEnv(gym.Env):
             self.cube_friction = blend(0.55, 0.35, 0.80)
             self.finger_friction = blend(1.00, 0.70, 1.30)
             self.gripper_motor_force = blend(60.0, 45.0, 75.0)
-        self.cube_yaw = severity * float(
+        pose_severity = max(severity, self.pose_randomization)
+        self.cube_yaw = pose_severity * float(
             self.np_random.uniform(-math.pi / 4, math.pi / 4))
         self.motor_force = blend(300.0, 240.0, 360.0)
         self.motor_velocity = blend(1.5, 1.2, 1.8)
@@ -947,12 +995,21 @@ class RobotGraspEnv(gym.Env):
                 observation,
                 self.command_history.reshape(-1),
             ])
-        if self.observe_physical_residual:
+        if self.observe_physical_residual or self.observe_cube_yaw:
             interaction_gate = float(
                 self._distance_to_cube() < FINE_ALIGNMENT_DISTANCE)
+        if self.observe_physical_residual:
             observation = np.concatenate([
                 observation,
                 observation[:BASE_OBSERVATION_SIZE] * interaction_gate,
+            ])
+        if self.observe_cube_yaw:
+            observation = np.concatenate([
+                observation,
+                interaction_gate * np.array([
+                    math.sin(self.cube_yaw),
+                    math.cos(self.cube_yaw),
+                ]),
             ])
         return np.clip(observation, -5.0, 5.0).astype(np.float32)
 
@@ -974,7 +1031,10 @@ class RobotGraspEnv(gym.Env):
             "cube_mass": self.cube_mass,
             "cube_friction": self.cube_friction,
             "cube_yaw": self.cube_yaw,
+            "cube_x": float(self.cube_start_pos[0]),
+            "cube_y": float(self.cube_start_pos[1]),
             "action_delay_steps": self.action_delay_steps,
+            "pose_randomization": self.pose_randomization,
             "finger_friction": self.finger_friction,
             "gripper_motor_force": self.gripper_motor_force,
             "grasp_constraint_force": self.grasp_constraint_force,
@@ -1080,26 +1140,37 @@ def evaluate_grasp(
     seed: int,
     difficulty: float = 1.0,
     randomization: float = 0.0,
+    pose_randomization: float = 0.0,
     grasp_constraint_force: float = 300.0,
 ) -> dict[str, float | int]:
     """Evaluate RL alone; IK is never called in this function."""
 
+    observation_size = int(model.observation_space.shape[0])
+    action_history_size = ACTION_HISTORY_STEPS * int(model.action_space.shape[0])
     env = RobotGraspEnv(
         difficulty=difficulty,
         randomization=randomization,
+        pose_randomization=pose_randomization,
         observe_action_history=(
-            int(model.observation_space.shape[0])
+            observation_size
             in (
-                BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * 8,
-                2 * BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * 8,
+                BASE_OBSERVATION_SIZE + action_history_size,
+                2 * BASE_OBSERVATION_SIZE + action_history_size,
+                2 * BASE_OBSERVATION_SIZE + action_history_size + 2,
             )
         ),
         observe_physical_residual=(
-            int(model.observation_space.shape[0])
+            observation_size
             in (
                 2 * BASE_OBSERVATION_SIZE,
-                2 * BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * 8,
+                2 * BASE_OBSERVATION_SIZE + 2,
+                2 * BASE_OBSERVATION_SIZE + action_history_size,
+                2 * BASE_OBSERVATION_SIZE + action_history_size + 2,
             )
+        ),
+        observe_cube_yaw=observation_size in (
+            2 * BASE_OBSERVATION_SIZE + 2,
+            2 * BASE_OBSERVATION_SIZE + action_history_size + 2,
         ),
         grasp_constraint_force=grasp_constraint_force,
     )
@@ -1113,6 +1184,9 @@ def evaluate_grasp(
     cube_sizes: list[float] = []
     cube_masses: list[float] = []
     cube_frictions: list[float] = []
+    cube_x_positions: list[float] = []
+    cube_y_positions: list[float] = []
+    cube_yaws: list[float] = []
     action_delays: list[int] = []
     episode_successes: list[bool] = []
     constraint_activations = 0
@@ -1122,6 +1196,9 @@ def evaluate_grasp(
             cube_sizes.append(float(reset_info["cube_size"]))
             cube_masses.append(float(reset_info["cube_mass"]))
             cube_frictions.append(float(reset_info["cube_friction"]))
+            cube_x_positions.append(float(reset_info["cube_x"]))
+            cube_y_positions.append(float(reset_info["cube_y"]))
+            cube_yaws.append(float(reset_info["cube_yaw"]))
             action_delays.append(int(reset_info["action_delay_steps"]))
             best_lift = 0.0
             minimum_distance = float("inf")
@@ -1166,6 +1243,7 @@ def evaluate_grasp(
         "p95_lift_height_m": float(np.percentile(lift_heights, 95)),
         "mean_steps": float(np.mean(episode_steps)),
         "randomization": randomization,
+        "pose_randomization": pose_randomization,
         "grasp_constraint_force": grasp_constraint_force,
         "constraint_activations": int(constraint_activations),
         "cube_size_min_m": float(np.min(cube_sizes)),
@@ -1174,6 +1252,12 @@ def evaluate_grasp(
         "cube_mass_max_kg": float(np.max(cube_masses)),
         "cube_friction_min": float(np.min(cube_frictions)),
         "cube_friction_max": float(np.max(cube_frictions)),
+        "cube_x_min_m": float(np.min(cube_x_positions)),
+        "cube_x_max_m": float(np.max(cube_x_positions)),
+        "cube_y_min_m": float(np.min(cube_y_positions)),
+        "cube_y_max_m": float(np.max(cube_y_positions)),
+        "cube_yaw_min_rad": float(np.min(cube_yaws)),
+        "cube_yaw_max_rad": float(np.max(cube_yaws)),
         "action_delay_max_steps": int(np.max(action_delays)),
     }
     delay_array = np.asarray(action_delays)
@@ -1220,6 +1304,17 @@ def print_grasp_evaluation(label: str, metrics: dict[str, float | int]) -> None:
             f"摩擦系数={metrics['cube_friction_min']:.2f}",
             flush=True,
         )
+    if float(metrics.get("pose_randomization", 0.0)) > 0.0:
+        print(
+            "      姿态范围："
+            f"x=[{metrics['cube_x_min_m']:.3f}, "
+            f"{metrics['cube_x_max_m']:.3f}]m | "
+            f"y=[{metrics['cube_y_min_m']:.3f}, "
+            f"{metrics['cube_y_max_m']:.3f}]m | "
+            f"yaw=[{math.degrees(metrics['cube_yaw_min_rad']):.1f}, "
+            f"{math.degrees(metrics['cube_yaw_max_rad']):.1f}]°",
+            flush=True,
+        )
 
 
 def grasp_checkpoint_score(
@@ -1239,7 +1334,13 @@ def grasp_checkpoint_score(
 def train_grasp(config: GraspTrainingConfig) -> dict:
     physical = config.grasp_constraint_force <= 0.0
     robust = max(config.randomization_curriculum, default=0.0) > 0.0
-    if physical:
+    pose_randomized = max(
+        config.pose_randomization_curriculum, default=0.0) > 0.0
+    if physical and pose_randomized:
+        model_path = POSE_PHYSICAL_GRASP_MODEL_PATH
+        best_model_path = BEST_POSE_PHYSICAL_GRASP_MODEL_PATH
+        metrics_path = POSE_PHYSICAL_GRASP_METRICS_PATH
+    elif physical:
         model_path = PHYSICAL_GRASP_MODEL_PATH
         best_model_path = BEST_PHYSICAL_GRASP_MODEL_PATH
         metrics_path = PHYSICAL_GRASP_METRICS_PATH
@@ -1252,6 +1353,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
         best_model_path = BEST_GRASP_MODEL_PATH
         metrics_path = GRASP_METRICS_PATH
     evaluation_randomization = 1.0 if robust else 0.0
+    evaluation_pose_randomization = 1.0 if pose_randomized else 0.0
     print("=" * 72)
     mode = (
         "纯物理摩擦抓取"
@@ -1267,15 +1369,19 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
     train_env = RobotGraspEnv(
         difficulty=config.curriculum[0],
         randomization=config.randomization_curriculum[0],
+        pose_randomization=config.pose_randomization_curriculum[0],
         observe_action_history=robust,
         observe_physical_residual=physical,
+        observe_cube_yaw=physical and pose_randomized,
         grasp_constraint_force=config.grasp_constraint_force,
     )
     data_env = RobotGraspEnv(
         difficulty=1.0,
         randomization=evaluation_randomization,
+        pose_randomization=evaluation_pose_randomization,
         observe_action_history=robust,
         observe_physical_residual=physical,
+        observe_cube_yaw=physical and pose_randomized,
         grasp_constraint_force=config.grasp_constraint_force,
     )
     model = build_grasp_td3(train_env, config.seed)
@@ -1291,6 +1397,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 episodes=config.eval_episodes,
                 seed=config.seed + 100_000,
                 randomization=evaluation_randomization,
+                pose_randomization=evaluation_pose_randomization,
                 grasp_constraint_force=config.grasp_constraint_force,
             )
             print_grasp_evaluation("基线模型热启动", metrics)
@@ -1321,6 +1428,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             episodes=config.eval_episodes,
             seed=config.seed + 100_000,
             randomization=evaluation_randomization,
+            pose_randomization=evaluation_pose_randomization,
             grasp_constraint_force=config.grasp_constraint_force,
         )
         print_grasp_evaluation("行为克隆", metrics)
@@ -1374,6 +1482,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 episodes=config.eval_episodes,
                 seed=config.seed + 100_000,
                 randomization=evaluation_randomization,
+                pose_randomization=evaluation_pose_randomization,
                 grasp_constraint_force=config.grasp_constraint_force,
             )
             print_grasp_evaluation(f"DAgger {iteration + 1}", metrics)
@@ -1417,16 +1526,23 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
         )
         warmup_critic(model, config.critic_warmup_steps)
         total_rl_steps = 0
-        for phase, (difficulty, randomization, phase_steps) in enumerate(
+        for phase, (
+            difficulty,
+            randomization,
+            pose_randomization,
+            phase_steps,
+        ) in enumerate(
             zip(
                 config.curriculum,
                 config.randomization_curriculum,
+                config.pose_randomization_curriculum,
                 config.rl_phase_steps,
             ),
             start=1,
         ):
             train_env.set_difficulty(difficulty)
             train_env.set_randomization(randomization)
+            train_env.set_pose_randomization(pose_randomization)
             model.learn(
                 total_timesteps=phase_steps,
                 reset_num_timesteps=False,
@@ -1442,11 +1558,13 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 # curriculum difficulty affects data collection only.
                 difficulty=1.0,
                 randomization=evaluation_randomization,
+                pose_randomization=evaluation_pose_randomization,
                 grasp_constraint_force=config.grasp_constraint_force,
             )
             label = (
                 f"TD3+BC阶段{phase} difficulty={difficulty:.2f} "
-                f"randomization={randomization:.2f}"
+                f"randomization={randomization:.2f} "
+                f"pose_randomization={pose_randomization:.2f}"
             )
             print_grasp_evaluation(label, metrics)
             print(
@@ -1460,6 +1578,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 "stage": f"td3_bc_{phase}",
                 "difficulty": difficulty,
                 "randomization": randomization,
+                "pose_randomization": pose_randomization,
                 "rl_steps": total_rl_steps,
                 "reference_action_drift": action_drift,
                 **metrics,
@@ -1495,6 +1614,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             seed=config.seed + 200_000,
             difficulty=1.0,
             randomization=evaluation_randomization,
+            pose_randomization=evaluation_pose_randomization,
             grasp_constraint_force=config.grasp_constraint_force,
         )
         print_grasp_evaluation("最终RL独立测试集", final_metrics)

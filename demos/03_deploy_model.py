@@ -24,13 +24,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from grasp_training import (
     GRASP_MODEL_PATH,
     PHYSICAL_GRASP_MODEL_PATH,
+    POSE_PHYSICAL_GRASP_MODEL_PATH,
     ROBUST_GRASP_MODEL_PATH,
     RobotGraspEnv,
 )
 from rl_training import MODEL_PATH, RobotArmEnv
 
 
-def deploy_in_simulation(task="reach", *, robust=False, physical=False):
+def deploy_in_simulation(
+    task="reach",
+    *,
+    robust=False,
+    physical=False,
+    random_pose=False,
+):
     """在仿真中部署AI模型"""
     print("=" * 60)
     print("  部署AI模型到仿真机器人")
@@ -39,7 +46,9 @@ def deploy_in_simulation(task="reach", *, robust=False, physical=False):
 
     # 1. 加载训练好的 TD3+BC 模型
     model_path = (
-        PHYSICAL_GRASP_MODEL_PATH
+        POSE_PHYSICAL_GRASP_MODEL_PATH
+        if task == "grasp" and physical and random_pose
+        else PHYSICAL_GRASP_MODEL_PATH
         if task == "grasp" and physical
         else ROBUST_GRASP_MODEL_PATH
         if task == "grasp" and robust
@@ -59,8 +68,11 @@ def deploy_in_simulation(task="reach", *, robust=False, physical=False):
         RobotGraspEnv(
             render=True,
             randomization=1.0 if robust else 0.0,
+            pose_randomization=1.0 if random_pose else 0.0,
             observe_action_history=robust,
             observe_physical_residual=physical,
+            observe_cube_yaw=(
+                physical and int(policy.observation_space.shape[0]) >= 50),
             grasp_constraint_force=0.0 if physical else 300.0,
         )
         if task == "grasp"
@@ -87,8 +99,13 @@ def deploy_in_simulation(task="reach", *, robust=False, physical=False):
 
             target_position = (
                 env.cube_start_pos if task == "grasp" else env.target_pos)
+            pose_suffix = (
+                f", yaw: {env.cube_yaw * 180.0 / 3.141592653589793:.1f}°"
+                if task == "grasp" and random_pose
+                else ""
+            )
             print(f"--- 第 {episode} 轮 (目标位置: "
-                  f"{target_position.round(3)}) ---")
+                  f"{target_position.round(3)}{pose_suffix}) ---")
 
             for step in range(env.max_steps):
                 # AI推理：观测 → 动作
@@ -162,6 +179,9 @@ def parse_args():
     parser.add_argument(
         "--physical", action="store_true",
         help="deploy the constraint-free friction grasp model")
+    parser.add_argument(
+        "--random-pose", action="store_true",
+        help="use the wider-position, randomized-yaw physical model")
     return parser.parse_args()
 
 
@@ -173,9 +193,12 @@ if __name__ == "__main__":
         raise SystemExit("--physical is only available with --task grasp")
     if args.physical and args.robust:
         raise SystemExit("choose either --physical or --robust")
+    if args.random_pose and not args.physical:
+        raise SystemExit("--random-pose requires --task grasp --physical")
     show_deployment_comparison()
     deploy_in_simulation(
         args.task,
         robust=args.robust,
         physical=args.physical,
+        random_pose=args.random_pose,
     )

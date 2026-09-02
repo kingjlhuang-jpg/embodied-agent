@@ -1134,6 +1134,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--physical", action="store_true",
         help="train grasping with finger contact/friction and no fixed constraint")
+    parser.add_argument(
+        "--random-pose", action="store_true",
+        help="expand physical grasp positions and randomize cube yaw")
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument(
         "--check-env", action="store_true",
@@ -1151,6 +1154,8 @@ def main() -> None:
         raise SystemExit(
             "combine physical contact and domain randomization in a later stage; "
             "choose either --physical or --robust")
+    if args.random_pose and not args.physical:
+        raise SystemExit("--random-pose requires --task grasp --physical")
     if args.task == "grasp":
         from grasp_training import (  # Imported lazily to avoid a cycle.
             GraspTrainingConfig,
@@ -1161,8 +1166,10 @@ def main() -> None:
         if args.check_env:
             env = RobotGraspEnv(
                 randomization=1.0 if args.robust else 0.0,
+                pose_randomization=1.0 if args.random_pose else 0.0,
                 observe_action_history=args.robust,
                 observe_physical_residual=args.physical,
+                observe_cube_yaw=args.random_pose,
                 grasp_constraint_force=0.0 if args.physical else 300.0,
             )
             try:
@@ -1172,11 +1179,18 @@ def main() -> None:
                 env.close()
             return
         if args.physical:
-            config = (
-                GraspTrainingConfig.quick_physical(args.seed)
-                if args.quick
-                else GraspTrainingConfig.physical(args.seed)
-            )
+            if args.random_pose:
+                config = (
+                    GraspTrainingConfig.quick_physical_pose(args.seed)
+                    if args.quick
+                    else GraspTrainingConfig.physical_pose(args.seed)
+                )
+            else:
+                config = (
+                    GraspTrainingConfig.quick_physical(args.seed)
+                    if args.quick
+                    else GraspTrainingConfig.physical(args.seed)
+                )
         elif args.robust:
             config = (
                 GraspTrainingConfig.quick_robust(args.seed)
