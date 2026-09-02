@@ -64,6 +64,12 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
         self.assertEqual(config.randomization_curriculum, (0.35, 0.70, 1.0))
         self.assertEqual(config.final_eval_episodes, 1_000)
 
+    def test_physical_config_disables_fixed_grasp_constraint(self):
+        config = GraspTrainingConfig.physical(seed=8)
+        self.assertEqual(config.seed, 8)
+        self.assertEqual(config.grasp_constraint_force, 0.0)
+        self.assertEqual(config.final_eval_episodes, 1_000)
+
     def test_checkpoint_score_keeps_partial_grasp_progress(self):
         base = {
             "success_rate": 0.0,
@@ -147,6 +153,50 @@ class RobotGraspEnvironmentTest(unittest.TestCase):
             command = np.linspace(-1.0, 1.0, 8, dtype=np.float32)
             observation, *_ = env.step(command)
             np.testing.assert_allclose(observation[-8:], command)
+        finally:
+            env.close()
+
+    def test_physical_residual_observation_is_gated_until_alignment(self):
+        env = RobotGraspEnv(
+            grasp_constraint_force=0.0,
+            observe_physical_residual=True,
+            max_steps=2,
+        )
+        try:
+            observation, _ = env.reset(seed=655)
+            self.assertEqual(observation.shape, (48,))
+            if env._distance_to_cube() >= 0.075:
+                np.testing.assert_array_equal(observation[-24:], 0.0)
+        finally:
+            env.close()
+
+    def test_physical_center_grasp_lifts_but_edge_grasp_slips(self):
+        env = RobotGraspEnv(grasp_constraint_force=0.0)
+
+        def rollout(offset_x: float) -> tuple[bool, bool, dict]:
+            _, reset_info = env.reset(seed=95_000)
+            constraint_seen = False
+            for _ in range(env.max_steps):
+                action = env.get_ik_action(np.array(
+                    [offset_x, 0.0, 0.0], dtype=np.float32))
+                _, _, terminated, truncated, info = env.step(action)
+                constraint_seen = (
+                    constraint_seen or bool(info["constraint_active"])
+                )
+                if terminated or truncated:
+                    break
+            return bool(info["is_success"]), constraint_seen, reset_info
+
+        try:
+            centered, centered_constraint, reset_info = rollout(0.0)
+            edge, edge_constraint, _ = rollout(0.04)
+            self.assertTrue(centered)
+            self.assertFalse(edge)
+            self.assertFalse(centered_constraint)
+            self.assertFalse(edge_constraint)
+            self.assertAlmostEqual(reset_info["cube_mass"], 0.20)
+            self.assertAlmostEqual(reset_info["cube_friction"], 0.55)
+            self.assertAlmostEqual(reset_info["gripper_motor_force"], 60.0)
         finally:
             env.close()
 

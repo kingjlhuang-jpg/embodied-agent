@@ -23,13 +23,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 复用训练时的环境定义
 from grasp_training import (
     GRASP_MODEL_PATH,
+    PHYSICAL_GRASP_MODEL_PATH,
     ROBUST_GRASP_MODEL_PATH,
     RobotGraspEnv,
 )
 from rl_training import MODEL_PATH, RobotArmEnv
 
 
-def deploy_in_simulation(task="reach", *, robust=False):
+def deploy_in_simulation(task="reach", *, robust=False, physical=False):
     """在仿真中部署AI模型"""
     print("=" * 60)
     print("  部署AI模型到仿真机器人")
@@ -38,7 +39,9 @@ def deploy_in_simulation(task="reach", *, robust=False):
 
     # 1. 加载训练好的 TD3+BC 模型
     model_path = (
-        ROBUST_GRASP_MODEL_PATH
+        PHYSICAL_GRASP_MODEL_PATH
+        if task == "grasp" and physical
+        else ROBUST_GRASP_MODEL_PATH
         if task == "grasp" and robust
         else GRASP_MODEL_PATH if task == "grasp" else MODEL_PATH
     )
@@ -57,6 +60,8 @@ def deploy_in_simulation(task="reach", *, robust=False):
             render=True,
             randomization=1.0 if robust else 0.0,
             observe_action_history=robust,
+            observe_physical_residual=physical,
+            grasp_constraint_force=0.0 if physical else 300.0,
         )
         if task == "grasp"
         else RobotArmEnv(render=True)
@@ -66,6 +71,8 @@ def deploy_in_simulation(task="reach", *, robust=False):
     print("开始运行！你可以用鼠标旋转视角。")
     if task == "grasp":
         print("AI将尝试接近红色方块、合拢夹爪并将它稳定抬起。")
+        if physical:
+            print("物理模式：无固定约束，方块仅由双指夹紧力和摩擦承重。")
     else:
         print("AI将尝试控制机械臂到达绿色目标球。")
     print("按 Ctrl+C 退出。")
@@ -152,6 +159,9 @@ def parse_args():
     parser.add_argument(
         "--robust", action="store_true",
         help="deploy the domain-randomized grasp model and environment")
+    parser.add_argument(
+        "--physical", action="store_true",
+        help="deploy the constraint-free friction grasp model")
     return parser.parse_args()
 
 
@@ -159,5 +169,13 @@ if __name__ == "__main__":
     args = parse_args()
     if args.robust and args.task != "grasp":
         raise SystemExit("--robust is only available with --task grasp")
+    if args.physical and args.task != "grasp":
+        raise SystemExit("--physical is only available with --task grasp")
+    if args.physical and args.robust:
+        raise SystemExit("choose either --physical or --robust")
     show_deployment_comparison()
-    deploy_in_simulation(args.task, robust=args.robust)
+    deploy_in_simulation(
+        args.task,
+        robust=args.robust,
+        physical=args.physical,
+    )

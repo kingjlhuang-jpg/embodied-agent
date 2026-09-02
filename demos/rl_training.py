@@ -697,6 +697,80 @@ def collect_demonstrations(
     )
 
 
+def collect_failure_demonstrations(
+    env: gym.Env,
+    steps: int,
+    *,
+    seed: int,
+    model: TD3,
+    noise_scale: float = 0.0,
+) -> Demonstrations:
+    """Label policy-only trajectories and retain only failed episodes."""
+
+    rng = np.random.default_rng(seed)
+    retained: list[Demonstrations] = []
+    retained_steps = 0
+    episode = 0
+    while retained_steps < steps:
+        observation, _ = env.reset(seed=seed + episode)
+        episode_observations = []
+        episode_teacher_actions = []
+        episode_executed_actions = []
+        episode_next_observations = []
+        episode_rewards = []
+        episode_dones = []
+        episode_phases = []
+        info: dict[str, float | bool] = {}
+        for _ in range(env.max_steps):
+            get_phase = getattr(env, "get_demonstration_phase", None)
+            phase = int(get_phase()) if get_phase is not None else 0
+            teacher_action = env.get_ik_action()
+            policy_action, _ = model.predict(observation, deterministic=True)
+            executed_action = np.clip(
+                np.asarray(policy_action)
+                + rng.normal(0.0, noise_scale, size=env.action_space.shape),
+                -1.0,
+                1.0,
+            ).astype(np.float32)
+            next_observation, reward, terminated, truncated, info = env.step(
+                executed_action)
+            done = terminated or truncated
+            episode_observations.append(observation)
+            episode_teacher_actions.append(teacher_action)
+            episode_executed_actions.append(executed_action)
+            episode_next_observations.append(next_observation)
+            episode_rewards.append(reward)
+            episode_dones.append(done)
+            episode_phases.append(phase)
+            observation = next_observation
+            if done:
+                break
+
+        if not bool(info.get("is_success", False)):
+            episode_data = Demonstrations(
+                observations=np.asarray(
+                    episode_observations, dtype=np.float32),
+                teacher_actions=np.asarray(
+                    episode_teacher_actions, dtype=np.float32),
+                executed_actions=np.asarray(
+                    episode_executed_actions, dtype=np.float32),
+                next_observations=np.asarray(
+                    episode_next_observations, dtype=np.float32),
+                rewards=np.asarray(episode_rewards, dtype=np.float32),
+                dones=np.asarray(episode_dones, dtype=np.float32),
+                phases=np.asarray(episode_phases, dtype=np.int64),
+            )
+            retained.append(episode_data)
+            retained_steps += len(episode_data)
+        episode += 1
+
+    combined = Demonstrations.concatenate(retained)
+    return Demonstrations(*(
+        getattr(combined, field)[:steps]
+        for field in Demonstrations.__dataclass_fields__
+    ))
+
+
 def pretrain_actor(
     model: TD3,
     demonstrations: Demonstrations,
@@ -1057,6 +1131,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--robust", action="store_true",
         help="train grasping with physics, sensor, and latency randomization")
+    parser.add_argument(
+        "--physical", action="store_true",
+        help="train grasping with finger contact/friction and no fixed constraint")
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument(
         "--check-env", action="store_true",
@@ -1068,6 +1145,12 @@ def main() -> None:
     args = parse_args()
     if args.robust and args.task != "grasp":
         raise SystemExit("--robust is only available with --task grasp")
+    if args.physical and args.task != "grasp":
+        raise SystemExit("--physical is only available with --task grasp")
+    if args.physical and args.robust:
+        raise SystemExit(
+            "combine physical contact and domain randomization in a later stage; "
+            "choose either --physical or --robust")
     if args.task == "grasp":
         from grasp_training import (  # Imported lazily to avoid a cycle.
             GraspTrainingConfig,
@@ -1079,6 +1162,8 @@ def main() -> None:
             env = RobotGraspEnv(
                 randomization=1.0 if args.robust else 0.0,
                 observe_action_history=args.robust,
+                observe_physical_residual=args.physical,
+                grasp_constraint_force=0.0 if args.physical else 300.0,
             )
             try:
                 check_env(env, warn=True)
@@ -1086,7 +1171,13 @@ def main() -> None:
             finally:
                 env.close()
             return
-        if args.robust:
+        if args.physical:
+            config = (
+                GraspTrainingConfig.quick_physical(args.seed)
+                if args.quick
+                else GraspTrainingConfig.physical(args.seed)
+            )
+        elif args.robust:
             config = (
                 GraspTrainingConfig.quick_robust(args.seed)
                 if args.quick

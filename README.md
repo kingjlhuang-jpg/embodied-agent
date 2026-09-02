@@ -63,6 +63,7 @@ TD3+BC 强化学习微调。IK 只在训练阶段担任老师，最终评估和�
 # reach: 13维观测 → 7个手臂关节
 # grasp: 24维观测 → 7个手臂关节 + 1个夹爪开合
 # robust grasp: 再加入最近2步动作历史，共40维观测
+# physical grasp: 增加接触阶段残差状态，共48维观测
 action = policy_network(obs)         # 决策（AI 推理）
 env.step(action)                     # 执行并计算接触/抬升奖励
 ```
@@ -81,12 +82,18 @@ python demos/02_rl_training.py --task grasp --robust
 
 # 快速验证鲁棒训练流水线
 python demos/02_rl_training.py --task grasp --robust --quick
+
+# 纯物理摩擦抓取：不创建固定约束
+python demos/02_rl_training.py --task grasp --physical
+
+# 快速验证物理抓取流水线
+python demos/02_rl_training.py --task grasp --physical --quick
 ```
 
 抓取奖励按任务阶段递增：靠近方块获得小奖励，左右手指同时接触获得中等奖励，
-方块离开台面获得大奖励，持续抬高 3.5 cm 才判定成功。为避免轻量级
-PyBullet 夹爪在接触后数值打滑，环境只在检测到双侧真实碰撞后建立有限力的
-抓取约束；抓住后重新张开会释放方块并判定本回合失败。
+方块离开台面获得大奖励，持续抬高 3.5 cm 才判定成功。基线与鲁棒模式为避免
+轻量级 PyBullet 夹爪在接触后数值打滑，只在检测到双侧真实碰撞后建立有限力
+抓取约束；`--physical` 模式则完全禁用该约束，只依靠夹紧力和摩擦。
 
 训练会平衡采样“接近 / 对准闭合 / 抬起保持”三个阶段，提高夹爪动作的行为
 克隆权重，并用 Q-filter 只在 IK 动作优于当前策略时施加教师约束。固定种子的
@@ -99,6 +106,14 @@ PyBullet 夹爪在接触后数值打滑，环境只在检测到双侧真实碰�
 40 维网络，旧通道被冻结，只训练新增的历史残差权重。训练使用最佳检查点保护，
 未超过基线的候选不会覆盖模型。固定种子的 1000 回合全随机化盲测结果为
 938/1000（93.8%），其中 0/1/2 步延迟成功率分别为 95.8%/93.9%/91.7%。
+
+`--physical` 完全禁止 `JOINT_FIXED` 抓取约束，使用 200 g 方块、0.55 方块
+摩擦系数和 60 N 有限夹爪电机力。抓取状态必须由持续双指接触建立，接触丢失
+会产生真实滑落并判定失败。正中 IK 夹持参考成功率为 58/60；故意沿夹爪轴
+偏移 4 cm 的边缘夹持为 0/20。最终纯 RL 在 1000 回合独立测试中达到
+858/1000（85.8%），且固定约束激活次数为 0。模型单独保存为
+`physical_grasp_policy.zip`，不会覆盖辅助抓取模型。本轮在线候选没有超过
+75 回合保护集，因此最终保留的是无损扩展后的最佳基线，而不是较差的新权重。
 
 ### Demo 3: 模型部署
 
@@ -115,6 +130,7 @@ env.step(action)                         ros_node.send_cmd(action)
 python demos/03_deploy_model.py --task reach
 python demos/03_deploy_model.py --task grasp
 python demos/03_deploy_model.py --task grasp --robust
+python demos/03_deploy_model.py --task grasp --physical
 ```
 
 ### Demo 4: 宇树 G1 人形机器人动作

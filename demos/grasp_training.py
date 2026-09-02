@@ -2,9 +2,9 @@
 
 The inverse-kinematics teacher handles the long-horizon arm motion while the
 policy learns the complete 8-dimensional action: seven arm joints plus one
-continuous gripper command.  A grasp is latched only after both finger groups
-touch the dynamic cube, which keeps the simplified simulator stable enough for
-fast local reinforcement-learning experiments.
+continuous gripper command.  The baseline can use a finite-force grasp assist;
+physical mode disables it completely and requires sustained bilateral contact,
+bounded motor force, and friction to lift a heavier dynamic cube.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from rl_training import (
     GuidedTD3,
     add_to_replay_buffer,
     collect_demonstrations,
+    collect_failure_demonstrations,
     pretrain_actor,
     warmup_critic,
 )
@@ -39,6 +40,8 @@ CUBE_HALF_EXTENT = 0.025
 CUBE_REST_Z = TABLE_TOP_Z + CUBE_HALF_EXTENT
 GRASP_SUCCESS_HEIGHT = 0.035
 GRASP_HOLD_STEPS = 8
+PHYSICAL_GRASP_CONFIRM_STEPS = 3
+PHYSICAL_CONTACT_LOSS_STEPS = 2
 GRASP_DISTANCE = 0.030
 SAFE_CLOSE_DISTANCE = 0.035
 FINE_ALIGNMENT_DISTANCE = 0.075
@@ -56,6 +59,9 @@ GRASP_METRICS_PATH = Path("grasp_training_metrics.json")
 ROBUST_GRASP_MODEL_PATH = Path("robust_grasp_policy.zip")
 BEST_ROBUST_GRASP_MODEL_PATH = Path("best_robust_grasp_policy.zip")
 ROBUST_GRASP_METRICS_PATH = Path("robust_grasp_training_metrics.json")
+PHYSICAL_GRASP_MODEL_PATH = Path("physical_grasp_policy.zip")
+BEST_PHYSICAL_GRASP_MODEL_PATH = Path("best_physical_grasp_policy.zip")
+PHYSICAL_GRASP_METRICS_PATH = Path("physical_grasp_training_metrics.json")
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,8 @@ class GraspTrainingConfig:
     hold_coefficient: float = 1.0
     anchor_coefficient: float = 0.0
     actor_learning_rate: float | None = None
+    grasp_constraint_force: float = 300.0
+    failure_only_dagger: bool = False
 
     @classmethod
     def quick(cls, seed: int = 20260901) -> "GraspTrainingConfig":
@@ -154,9 +162,65 @@ class GraspTrainingConfig:
             actor_learning_rate=1e-6,
         )
 
+    @classmethod
+    def physical(cls, seed: int = 20260901) -> "GraspTrainingConfig":
+        """Train a heavy cube grasp using only finger contact and friction."""
+
+        return cls(
+            seed=seed,
+            expert_steps=20_000,
+            bc_epochs=0,
+            dagger_iterations=3,
+            dagger_steps=4_000,
+            dagger_epochs=0,
+            critic_warmup_steps=2_000,
+            rl_phase_steps=(10_000, 15_000, 25_000),
+            curriculum=(1.0, 1.0, 1.0),
+            randomization_curriculum=(0.0, 0.0, 0.0),
+            eval_episodes=75,
+            final_eval_episodes=1_000,
+            target_success_rate=0.90,
+            rl_weight=0.002,
+            bc_start=0.50,
+            bc_end=0.10,
+            hold_coefficient=3.0,
+            anchor_coefficient=20.0,
+            actor_learning_rate=1e-7,
+            grasp_constraint_force=0.0,
+            failure_only_dagger=True,
+        )
+
+    @classmethod
+    def quick_physical(cls, seed: int = 20260901) -> "GraspTrainingConfig":
+        """Smoke-test the constraint-free physical grasp pipeline."""
+
+        return cls(
+            seed=seed,
+            expert_steps=2_000,
+            bc_epochs=0,
+            dagger_iterations=1,
+            dagger_steps=1_000,
+            dagger_epochs=0,
+            critic_warmup_steps=100,
+            rl_phase_steps=(1_000,),
+            curriculum=(1.0,),
+            randomization_curriculum=(0.0,),
+            eval_episodes=10,
+            final_eval_episodes=20,
+            target_success_rate=1.0,
+            rl_weight=0.002,
+            bc_start=0.50,
+            bc_end=0.10,
+            hold_coefficient=3.0,
+            anchor_coefficient=20.0,
+            actor_learning_rate=1e-7,
+            grasp_constraint_force=0.0,
+            failure_only_dagger=True,
+        )
+
 
 class RobotGraspEnv(gym.Env):
-    """Kuka iiwa + WSG50 task: approach, close, lift, and hold a cube."""
+    """Kuka iiwa + WSG50 task with assisted or friction-only grasping."""
 
     metadata = {"render_modes": ["human"], "render_fps": 60}
 
@@ -183,6 +247,8 @@ class RobotGraspEnv(gym.Env):
         difficulty: float = 1.0,
         randomization: float = 0.0,
         observe_action_history: bool = False,
+        observe_physical_residual: bool = False,
+        grasp_constraint_force: float = 300.0,
         max_steps: int = 300,
     ):
         super().__init__()
@@ -195,11 +261,15 @@ class RobotGraspEnv(gym.Env):
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
         self.randomization = float(np.clip(randomization, 0.0, 1.0))
         self.observe_action_history = bool(observe_action_history)
+        self.observe_physical_residual = bool(observe_physical_residual)
+        self.grasp_constraint_force = max(float(grasp_constraint_force), 0.0)
         self.max_steps = int(max_steps)
         self.action_space = spaces.Box(-1.0, 1.0, shape=(8,), dtype=np.float32)
         observation_size = BASE_OBSERVATION_SIZE
         if self.observe_action_history:
             observation_size += ACTION_HISTORY_STEPS * self.action_space.shape[0]
+        if self.observe_physical_residual:
+            observation_size += BASE_OBSERVATION_SIZE
         self.observation_space = spaces.Box(
             -5.0, 5.0, shape=(observation_size,), dtype=np.float32)
 
@@ -218,6 +288,9 @@ class RobotGraspEnv(gym.Env):
         self.robot_id = -1
         self.cube_id = -1
         self.grasp_constraint: int | None = None
+        self.physical_grasped = False
+        self.grasp_contact_steps = 0
+        self.contact_loss_steps = 0
         self.cube_start_pos = np.zeros(3, dtype=np.float64)
         self.lift_target_pos = np.zeros(3, dtype=np.float64)
         self.step_count = 0
@@ -237,9 +310,11 @@ class RobotGraspEnv(gym.Env):
         self.cube_friction = 2.5
         self.cube_yaw = 0.0
         self.finger_friction = 3.0
+        self.gripper_motor_force = 180.0
         self.motor_force = 300.0
         self.motor_velocity = 1.5
         self.gripper_command = -1.0
+        self.teacher_closing = False
         self.joint_lower = np.full(7, -np.pi, dtype=np.float64)
         self.joint_upper = np.full(7, np.pi, dtype=np.float64)
         self._ik_joints: list[int] = []
@@ -251,7 +326,11 @@ class RobotGraspEnv(gym.Env):
 
     @property
     def is_grasped(self) -> bool:
-        return self.grasp_constraint is not None
+        return self.grasp_constraint is not None or self.physical_grasped
+
+    @property
+    def uses_grasp_constraint(self) -> bool:
+        return self.grasp_constraint_force > 0.0
 
     def set_difficulty(self, difficulty: float) -> None:
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
@@ -357,9 +436,13 @@ class RobotGraspEnv(gym.Env):
         )
 
         self.grasp_constraint = None
+        self.physical_grasped = False
+        self.grasp_contact_steps = 0
+        self.contact_loss_steps = 0
         self.step_count = 0
         self.hold_steps = 0
         self.gripper_command = -1.0
+        self.teacher_closing = False
         self.previous_action.fill(0.0)
         self.command_history.fill(0.0)
         self.action_buffer = [
@@ -398,7 +481,7 @@ class RobotGraspEnv(gym.Env):
 
         released_cube = False
         if self.is_grasped and action[7] < -0.5:
-            self._release_cube()
+            self._clear_grasp_state()
             released_cube = True
 
         joint_positions = self._get_joint_positions()
@@ -421,15 +504,23 @@ class RobotGraspEnv(gym.Env):
 
         left_contact, right_contact = self._finger_contacts()
         newly_grasped = False
-        if (
-            not self.is_grasped
-            and action[7] > 0.35
-            and left_contact
-            and right_contact
-            and self._distance_to_cube() < 0.055
-        ):
-            self._attach_cube()
-            newly_grasped = True
+        if self.uses_grasp_constraint:
+            if (
+                not self.is_grasped
+                and action[7] > 0.35
+                and left_contact
+                and right_contact
+                and self._distance_to_cube() < 0.055
+            ):
+                self._attach_cube()
+                newly_grasped = True
+        else:
+            newly_grasped, contact_released = self._update_physical_grasp(
+                left_contact,
+                right_contact,
+                float(action[7]),
+            )
+            released_cube = released_cube or contact_released
 
         self.step_count += 1
         distance = self._distance_to_cube()
@@ -465,7 +556,12 @@ class RobotGraspEnv(gym.Env):
         if lift_height >= 0.02:
             reward += 1.0
 
-        stable_lift = self.is_grasped and lift_height >= GRASP_SUCCESS_HEIGHT
+        stable_lift = (
+            self.is_grasped
+            and left_contact
+            and right_contact
+            and lift_height >= GRASP_SUCCESS_HEIGHT
+        )
         self.hold_steps = self.hold_steps + 1 if stable_lift else 0
         grasp_succeeded = self.hold_steps >= GRASP_HOLD_STEPS
         if released_cube:
@@ -486,9 +582,18 @@ class RobotGraspEnv(gym.Env):
             self._info(distance),
         )
 
-    def get_ik_action(self) -> np.ndarray:
+    def get_ik_action(
+        self,
+        grasp_offset: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Scripted teacher: align open fingers, close on contact, then lift."""
 
+        if grasp_offset is None:
+            grasp_offset = np.zeros(3, dtype=np.float64)
+        else:
+            grasp_offset = np.asarray(grasp_offset, dtype=np.float64)
+            if grasp_offset.shape != (3,):
+                raise ValueError("grasp_offset must have shape (3,)")
         cube_position = self._get_cube_pos()
         end_effector_position = self._get_ee_pos()
         distance = self._distance_to_cube()
@@ -503,13 +608,17 @@ class RobotGraspEnv(gym.Env):
             gripper_action = 1.0
         else:
             desired_grasp_center = cube_position + np.array(
-                [0.0, 0.0, GRASP_CENTER_Z_OFFSET])
+                [0.0, 0.0, GRASP_CENTER_Z_OFFSET]) + grasp_offset
             target_position = (
                 end_effector_position
                 + desired_grasp_center
                 - self._get_grasp_center()
             )
-            gripper_action = 1.0 if distance < GRASP_DISTANCE else -1.0
+            if distance < GRASP_DISTANCE:
+                self.teacher_closing = True
+            elif distance > 2.0 * GRASP_DISTANCE:
+                self.teacher_closing = False
+            gripper_action = 1.0 if self.teacher_closing else -1.0
 
         rest_poses = [
             p.getJointState(
@@ -556,11 +665,21 @@ class RobotGraspEnv(gym.Env):
             return (1.0 - severity) * base + severity * sampled
 
         self.cube_half_extent = blend(CUBE_HALF_EXTENT, 0.020, 0.030)
-        self.cube_mass = blend(0.03, 0.02, 0.08)
-        self.cube_friction = blend(2.5, 0.8, 3.5)
+        if self.uses_grasp_constraint:
+            self.cube_mass = blend(0.03, 0.02, 0.08)
+            self.cube_friction = blend(2.5, 0.8, 3.5)
+            self.finger_friction = blend(3.0, 1.5, 4.0)
+            self.gripper_motor_force = 180.0
+        else:
+            # A 5 cm solid object is much heavier than the original 30 g
+            # training cube.  Moderate rubber/plastic friction and bounded
+            # finger force make off-centre pinches slip naturally.
+            self.cube_mass = blend(0.20, 0.10, 0.30)
+            self.cube_friction = blend(0.55, 0.35, 0.80)
+            self.finger_friction = blend(1.00, 0.70, 1.30)
+            self.gripper_motor_force = blend(60.0, 45.0, 75.0)
         self.cube_yaw = severity * float(
             self.np_random.uniform(-math.pi / 4, math.pi / 4))
-        self.finger_friction = blend(3.0, 1.5, 4.0)
         self.motor_force = blend(300.0, 240.0, 360.0)
         self.motor_velocity = blend(1.5, 1.2, 1.8)
 
@@ -644,7 +763,7 @@ class RobotGraspEnv(gym.Env):
                 joint,
                 p.POSITION_CONTROL,
                 targetPosition=float(target),
-                force=180,
+                force=self.gripper_motor_force,
                 maxVelocity=1.0,
                 physicsClientId=self.client,
             )
@@ -702,9 +821,48 @@ class RobotGraspEnv(gym.Env):
         )
         p.changeConstraint(
             self.grasp_constraint,
-            maxForce=300,
+            maxForce=self.grasp_constraint_force,
             physicsClientId=self.client,
         )
+
+    def _update_physical_grasp(
+        self,
+        left_contact: bool,
+        right_contact: bool,
+        gripper_action: float,
+    ) -> tuple[bool, bool]:
+        """Track sustained bilateral contact without attaching the cube."""
+
+        was_grasped = self.physical_grasped
+        valid_contact = (
+            gripper_action > 0.10
+            and left_contact
+            and right_contact
+            and self._distance_to_cube() < 0.055
+        )
+        if valid_contact:
+            self.grasp_contact_steps += 1
+            self.contact_loss_steps = 0
+            if self.grasp_contact_steps >= PHYSICAL_GRASP_CONFIRM_STEPS:
+                self.physical_grasped = True
+        else:
+            self.grasp_contact_steps = 0
+            if self.physical_grasped:
+                self.contact_loss_steps += 1
+                if (
+                    gripper_action < -0.5
+                    or self.contact_loss_steps >= PHYSICAL_CONTACT_LOSS_STEPS
+                ):
+                    self.physical_grasped = False
+                    self.contact_loss_steps = 0
+        return (not was_grasped and self.physical_grasped), (
+            was_grasped and not self.physical_grasped)
+
+    def _clear_grasp_state(self) -> None:
+        self._release_cube()
+        self.physical_grasped = False
+        self.grasp_contact_steps = 0
+        self.contact_loss_steps = 0
 
     def _release_cube(self) -> None:
         if self.grasp_constraint is not None:
@@ -789,6 +947,13 @@ class RobotGraspEnv(gym.Env):
                 observation,
                 self.command_history.reshape(-1),
             ])
+        if self.observe_physical_residual:
+            interaction_gate = float(
+                self._distance_to_cube() < FINE_ALIGNMENT_DISTANCE)
+            observation = np.concatenate([
+                observation,
+                observation[:BASE_OBSERVATION_SIZE] * interaction_gate,
+            ])
         return np.clip(observation, -5.0, 5.0).astype(np.float32)
 
     def _info(self, distance: float) -> dict[str, float | bool]:
@@ -810,12 +975,16 @@ class RobotGraspEnv(gym.Env):
             "cube_friction": self.cube_friction,
             "cube_yaw": self.cube_yaw,
             "action_delay_steps": self.action_delay_steps,
+            "finger_friction": self.finger_friction,
+            "gripper_motor_force": self.gripper_motor_force,
+            "grasp_constraint_force": self.grasp_constraint_force,
+            "constraint_active": self.grasp_constraint is not None,
         }
 
     def close(self):
         if getattr(self, "client", -1) >= 0 and p.isConnected(self.client):
             if self.grasp_constraint is not None:
-                self._release_cube()
+                self._clear_grasp_state()
             p.disconnect(self.client)
             self.client = -1
 
@@ -851,7 +1020,7 @@ def warm_start_grasp_model(
     model: GuidedTD3,
     source_path: Path,
 ) -> None:
-    """Expand a 24-D grasp policy to action-history input without drift."""
+    """Expand a 24-D grasp policy with zeroed residual inputs without drift."""
 
     source = GuidedTD3.load(source_path, device=model.device)
     source_observation_size = int(source.observation_space.shape[0])
@@ -862,8 +1031,7 @@ def warm_start_grasp_model(
         return
     if (
         source_observation_size != BASE_OBSERVATION_SIZE
-        or target_observation_size
-        != BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * action_size
+        or target_observation_size <= source_observation_size
     ):
         raise ValueError(
             "unsupported grasp-policy observation expansion: "
@@ -912,6 +1080,7 @@ def evaluate_grasp(
     seed: int,
     difficulty: float = 1.0,
     randomization: float = 0.0,
+    grasp_constraint_force: float = 300.0,
 ) -> dict[str, float | int]:
     """Evaluate RL alone; IK is never called in this function."""
 
@@ -919,7 +1088,20 @@ def evaluate_grasp(
         difficulty=difficulty,
         randomization=randomization,
         observe_action_history=(
-            int(model.observation_space.shape[0]) > BASE_OBSERVATION_SIZE),
+            int(model.observation_space.shape[0])
+            in (
+                BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * 8,
+                2 * BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * 8,
+            )
+        ),
+        observe_physical_residual=(
+            int(model.observation_space.shape[0])
+            in (
+                2 * BASE_OBSERVATION_SIZE,
+                2 * BASE_OBSERVATION_SIZE + ACTION_HISTORY_STEPS * 8,
+            )
+        ),
+        grasp_constraint_force=grasp_constraint_force,
     )
     successes = 0
     grasps = 0
@@ -933,6 +1115,7 @@ def evaluate_grasp(
     cube_frictions: list[float] = []
     action_delays: list[int] = []
     episode_successes: list[bool] = []
+    constraint_activations = 0
     try:
         for episode in range(episodes):
             observation, reset_info = env.reset(seed=seed + episode)
@@ -956,6 +1139,7 @@ def evaluate_grasp(
                     ever_bilateral_contact
                     or bool(info["left_contact"] and info["right_contact"])
                 )
+                constraint_activations += bool(info["constraint_active"])
                 if terminated or truncated:
                     break
             successes += bool(info.get("is_success", False))
@@ -982,6 +1166,8 @@ def evaluate_grasp(
         "p95_lift_height_m": float(np.percentile(lift_heights, 95)),
         "mean_steps": float(np.mean(episode_steps)),
         "randomization": randomization,
+        "grasp_constraint_force": grasp_constraint_force,
+        "constraint_activations": int(constraint_activations),
         "cube_size_min_m": float(np.min(cube_sizes)),
         "cube_size_max_m": float(np.max(cube_sizes)),
         "cube_mass_min_kg": float(np.min(cube_masses)),
@@ -1026,6 +1212,14 @@ def print_grasp_evaluation(label: str, metrics: dict[str, float | int]) -> None:
             f"({metrics['delay_2_episodes']}轮)",
             flush=True,
         )
+    if float(metrics.get("grasp_constraint_force", 300.0)) <= 0.0:
+        print(
+            "      纯物理证据：固定约束激活="
+            f"{metrics['constraint_activations']}步 | "
+            f"方块质量={metrics['cube_mass_min_kg'] * 1000:.0f}g | "
+            f"摩擦系数={metrics['cube_friction_min']:.2f}",
+            flush=True,
+        )
 
 
 def grasp_checkpoint_score(
@@ -1043,15 +1237,27 @@ def grasp_checkpoint_score(
 
 
 def train_grasp(config: GraspTrainingConfig) -> dict:
+    physical = config.grasp_constraint_force <= 0.0
     robust = max(config.randomization_curriculum, default=0.0) > 0.0
-    model_path = ROBUST_GRASP_MODEL_PATH if robust else GRASP_MODEL_PATH
-    best_model_path = (
-        BEST_ROBUST_GRASP_MODEL_PATH if robust else BEST_GRASP_MODEL_PATH)
-    metrics_path = (
-        ROBUST_GRASP_METRICS_PATH if robust else GRASP_METRICS_PATH)
+    if physical:
+        model_path = PHYSICAL_GRASP_MODEL_PATH
+        best_model_path = BEST_PHYSICAL_GRASP_MODEL_PATH
+        metrics_path = PHYSICAL_GRASP_METRICS_PATH
+    elif robust:
+        model_path = ROBUST_GRASP_MODEL_PATH
+        best_model_path = BEST_ROBUST_GRASP_MODEL_PATH
+        metrics_path = ROBUST_GRASP_METRICS_PATH
+    else:
+        model_path = GRASP_MODEL_PATH
+        best_model_path = BEST_GRASP_MODEL_PATH
+        metrics_path = GRASP_METRICS_PATH
     evaluation_randomization = 1.0 if robust else 0.0
     print("=" * 72)
-    mode = "域随机化鲁棒抓取" if robust else "基线抓取"
+    mode = (
+        "纯物理摩擦抓取"
+        if physical
+        else "域随机化鲁棒抓取" if robust else "基线抓取"
+    )
     print(f"  Demo 2 / Grasp: IK + DAgger + TD3+BC {mode}")
     print("  最终评估仅使用8维RL策略：7个手臂关节 + 夹爪开合")
     print("=" * 72, flush=True)
@@ -1062,11 +1268,15 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
         difficulty=config.curriculum[0],
         randomization=config.randomization_curriculum[0],
         observe_action_history=robust,
+        observe_physical_residual=physical,
+        grasp_constraint_force=config.grasp_constraint_force,
     )
     data_env = RobotGraspEnv(
         difficulty=1.0,
         randomization=evaluation_randomization,
         observe_action_history=robust,
+        observe_physical_residual=physical,
+        grasp_constraint_force=config.grasp_constraint_force,
     )
     model = build_grasp_td3(train_env, config.seed)
     history: list[dict] = []
@@ -1074,13 +1284,14 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
     best_checkpoint_score = (-1.0,) * 5
 
     try:
-        if robust and GRASP_MODEL_PATH.exists():
+        if (robust or physical) and GRASP_MODEL_PATH.exists():
             warm_start_grasp_model(model, GRASP_MODEL_PATH)
             metrics = evaluate_grasp(
                 model,
                 episodes=config.eval_episodes,
                 seed=config.seed + 100_000,
                 randomization=evaluation_randomization,
+                grasp_constraint_force=config.grasp_constraint_force,
             )
             print_grasp_evaluation("基线模型热启动", metrics)
             history.append({"stage": "warm_start", **metrics})
@@ -1110,6 +1321,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             episodes=config.eval_episodes,
             seed=config.seed + 100_000,
             randomization=evaluation_randomization,
+            grasp_constraint_force=config.grasp_constraint_force,
         )
         print_grasp_evaluation("行为克隆", metrics)
         history.append({"stage": "behavior_cloning", **metrics})
@@ -1127,14 +1339,25 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 best_model_path, exact_match=True, device=model.device)
             model.actor_target.load_state_dict(model.actor.state_dict())
             teacher_mix = max(0.6 - 0.2 * iteration, 0.1)
-            dagger_data = collect_demonstrations(
-                data_env,
-                config.dagger_steps,
-                seed=config.seed + 10_000 * (iteration + 1),
-                model=model,
-                teacher_mix=teacher_mix,
-                noise_scale=0.015,
-            )
+            if config.failure_only_dagger:
+                dagger_data = collect_failure_demonstrations(
+                    data_env,
+                    config.dagger_steps,
+                    seed=config.seed + 10_000 * (iteration + 1),
+                    model=model,
+                    noise_scale=0.0,
+                )
+                teacher_mix_label = "failure-only"
+            else:
+                dagger_data = collect_demonstrations(
+                    data_env,
+                    config.dagger_steps,
+                    seed=config.seed + 10_000 * (iteration + 1),
+                    model=model,
+                    teacher_mix=teacher_mix,
+                    noise_scale=0.015,
+                )
+                teacher_mix_label = f"{teacher_mix:.2f}"
             datasets.append(dagger_data)
             combined = Demonstrations.concatenate(datasets)
             bc_loss = pretrain_actor(
@@ -1151,10 +1374,11 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 episodes=config.eval_episodes,
                 seed=config.seed + 100_000,
                 randomization=evaluation_randomization,
+                grasp_constraint_force=config.grasp_constraint_force,
             )
             print_grasp_evaluation(f"DAgger {iteration + 1}", metrics)
             print(
-                f"      数据量={len(combined)}，teacher_mix={teacher_mix:.2f}，"
+                f"      数据量={len(combined)}，teacher_mix={teacher_mix_label}，"
                 f"loss={bc_loss:.6f}",
                 flush=True,
             )
@@ -1183,7 +1407,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             hold_coefficient=config.hold_coefficient,
             anchor_coefficient=config.anchor_coefficient,
             actor_trainable_suffix_start=(
-                BASE_OBSERVATION_SIZE if robust else None),
+                BASE_OBSERVATION_SIZE if (robust or physical) else None),
         )
         model.rl_weight = config.rl_weight
         model.actor_learning_rate = config.actor_learning_rate
@@ -1218,6 +1442,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
                 # curriculum difficulty affects data collection only.
                 difficulty=1.0,
                 randomization=evaluation_randomization,
+                grasp_constraint_force=config.grasp_constraint_force,
             )
             label = (
                 f"TD3+BC阶段{phase} difficulty={difficulty:.2f} "
@@ -1270,6 +1495,7 @@ def train_grasp(config: GraspTrainingConfig) -> dict:
             seed=config.seed + 200_000,
             difficulty=1.0,
             randomization=evaluation_randomization,
+            grasp_constraint_force=config.grasp_constraint_force,
         )
         print_grasp_evaluation("最终RL独立测试集", final_metrics)
         result = {
